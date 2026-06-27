@@ -28,3 +28,15 @@ pub fn build_loading_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
     razel_package::register_package_kinds(&mut engine, sys, root, eval);
     engine
 }
+
+/// Build an `Engine` spanning loading AND analysis: source → `.bzl` → packages → `CONFIGURED_TARGET`. A target's
+/// rule implementation runs over the engine, with providers propagating granularly across the dependency graph.
+pub fn build_analysis_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
+    let mut engine = Engine::new();
+    razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone());
+    let eval: Arc<dyn BzlEvaluator> = Arc::new(StarlarkEvaluator::new());
+    razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
+    razel_package::register_package_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
+    razel_analysis::register_analysis_kinds(&mut engine, sys, root, eval);
+    engine
+}

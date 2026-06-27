@@ -13,6 +13,7 @@ razel-os-api = { path = "../razel-os-api", version = "0.1.0" }
 razel-source = { path = "../razel-source", version = "0.1.0" }
 razel-load = { path = "../razel-load", version = "0.1.0" }
 razel-package = { path = "../razel-package", version = "0.1.0" }
+razel-analysis = { path = "../razel-analysis", version = "0.1.0" }
 razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
 razel-bzl-starlark = { path = "../razel-bzl-starlark", version = "0.1.0" }  # IMPL — permitted: composition root
 
@@ -22,3 +23,5 @@ razel-bzl-starlark = { path = "../razel-bzl-starlark", version = "0.1.0" }  # IM
 mutant_file_hashes_stat = ["razel-source/mutant_file_hashes_stat"]
 mutant_package_ignore_loads = ["razel-package/mutant_package_ignore_loads"]
 mutant_package_allow_dup_names = ["razel-bzl-starlark/mutant_package_allow_dup_names"]
+mutant_ct_drops_config = ["razel-analysis/mutant_ct_drops_config"]
+mutant_ct_skips_rule_file_dep = ["razel-analysis/mutant_ct_skips_rule_file_dep"]

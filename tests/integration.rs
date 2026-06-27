@@ -6,10 +6,11 @@
 use razel_core::{Digest, NodeKey, NodeValue};
 use razel_engine_api::{DemandEngine, Diff, FailurePolicy};
 use razel_bzl_api::{BzlValue, RuleOrigin};
-use razel_host::{build_loading_engine, build_source_engine};
+use razel_host::{build_analysis_engine, build_loading_engine, build_source_engine};
 use razel_ids::RootRelativePath;
 use razel_load::{BzlLoadKey, BzlModuleValue};
 use razel_package::{Package, PackageKey};
+use razel_analysis::{ConfiguredTarget, ConfiguredTargetKey};
 use razel_os_api::{
     EnvName, ExitStatus, FileKind, HostPath, Metadata, OsError, OsPathFragment, OsPathPolicy, OsValue,
     ProcessSpec, RawSymlinkTarget, System,
@@ -93,6 +94,32 @@ fn bget(v: &NodeValue, name: &str) -> Option<BzlValue> {
 }
 fn pkey(pkg: &str) -> NodeKey { NodeKey::from_key(&PackageKey(RootRelativePath(pkg.into()))) }
 fn pkg(v: &NodeValue) -> Package { v.as_any().downcast_ref::<Package>().unwrap().clone() }
+fn ctkey(pkg: &str, name: &str) -> NodeKey {
+    NodeKey::from_key(&ConfiguredTargetKey {
+        package: pkg.into(),
+        name: name.into(),
+        configuration: None,
+        exec_platform: None,
+        rule_transition: None,
+    })
+}
+fn ct_total(v: &NodeValue) -> i64 {
+    let ct = v.as_any().downcast_ref::<ConfiguredTarget>().unwrap();
+    match ct.provider("NumberInfo").and_then(|p| p.get("total")) {
+        Some(BzlValue::Int(i)) => *i,
+        other => panic!("expected NumberInfo.total: int, got {other:?}"),
+    }
+}
+
+// The sum-provider rule (the de-nativized-rule exam): a target's NumberInfo.total = its own value + the sum of
+// its deps' NumberInfo.total. A REAL .bzl impl, run through the Starlark seam — no Rust ruleset reimplementation.
+const SUM_RULES: &[u8] = b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
+def _impl(ctx):\n\
+\x20   t = ctx.attr.value\n\
+\x20   for d in ctx.attr.deps:\n\
+\x20       t += d[NumberInfo].total\n\
+\x20   return [NumberInfo(total = t)]\n\
+my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int(), \"deps\": attr.label_list()})\n";
 
 #[test]
 fn file_reflects_content() {
@@ -586,4 +613,171 @@ fn rule_schema_edit_rechecks_but_cuts_off_package() {
     let after = engine.version(&pkey("app")).unwrap();
     assert!(after.last_evaluated > before.last_evaluated, "PACKAGE re-evaluates (its loaded .bzl changed)");
     assert_eq!(after.last_changed, before.last_changed, "but the package value is unchanged → early cutoff (schema is analysis's concern, not loading's)");
+}
+
+// ──────────────── A4: the analysis exam — de-nativized rule impls run + providers propagate granularly ────
+
+#[test]
+fn configured_target_runs_rule_and_sums_providers() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/rules.bzl", SUM_RULES, 1);
+    fs.set(
+        "/w/pkg/BUILD.bazel",
+        b"load(\":rules.bzl\", \"my_rule\")\n\
+          my_rule(name = \"leaf\", value = 5)\n\
+          my_rule(name = \"mid\", value = 10, deps = [\":leaf\"])\n\
+          my_rule(name = \"root\", value = 100, deps = [\":mid\"])\n",
+        1,
+    );
+    let engine = build_analysis_engine(fs, HostPath::new("/w"));
+    assert_eq!(ct_total(&engine.request(&ctkey("pkg", "leaf")).unwrap()), 5, "leaf: 5, no deps");
+    assert_eq!(ct_total(&engine.request(&ctkey("pkg", "mid")).unwrap()), 15, "mid: 10 + leaf(5)");
+    assert_eq!(
+        ct_total(&engine.request(&ctkey("pkg", "root")).unwrap()),
+        115,
+        "root: 100 + mid(10 + 5) = 115 — a REAL .bzl rule impl ran and providers propagated along edges"
+    );
+}
+
+#[test]
+fn analysis_propagates_granularly() {
+    // Edit one target's value → its providers + its rdep's change; its DEP and an UNRELATED target cut off.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/rules.bzl", SUM_RULES, 1);
+    let build_v1 = b"load(\":rules.bzl\", \"my_rule\")\n\
+        my_rule(name = \"leaf\", value = 5)\n\
+        my_rule(name = \"mid\", value = 10, deps = [\":leaf\"])\n\
+        my_rule(name = \"root\", value = 100, deps = [\":mid\"])\n\
+        my_rule(name = \"other\", value = 1)\n";
+    fs.set("/w/pkg/BUILD.bazel", build_v1, 1);
+    let engine = build_analysis_engine(fs.clone(), HostPath::new("/w"));
+    let roots = [ctkey("pkg", "leaf"), ctkey("pkg", "mid"), ctkey("pkg", "root"), ctkey("pkg", "other")];
+    for r in &roots {
+        engine.request(r).unwrap();
+    }
+    let v = |n: &str| engine.version(&ctkey("pkg", n)).unwrap();
+    let (bl, bm, br, bo) = (v("leaf"), v("mid"), v("root"), v("other"));
+
+    // Edit ONLY mid's value (10 → 20).
+    fs.set(
+        "/w/pkg/BUILD.bazel",
+        b"load(\":rules.bzl\", \"my_rule\")\n\
+          my_rule(name = \"leaf\", value = 5)\n\
+          my_rule(name = \"mid\", value = 20, deps = [\":leaf\"])\n\
+          my_rule(name = \"root\", value = 100, deps = [\":mid\"])\n\
+          my_rule(name = \"other\", value = 1)\n",
+        2,
+    );
+    engine.evaluate(&roots, FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("pkg/BUILD.bazel")] });
+
+    let (al, am, ar, ao) = (v("leaf"), v("mid"), v("root"), v("other"));
+    assert!(am.last_changed > bm.last_changed, "mid's value changed → its providers change");
+    assert!(ar.last_changed > br.last_changed, "root depends on mid → it re-analyzes (providers propagate up)");
+    assert_eq!(al.last_changed, bl.last_changed, "leaf is mid's DEP, not its rdep → unchanged (early cutoff)");
+    assert_eq!(ao.last_changed, bo.last_changed, "other is unrelated → unchanged (early cutoff)");
+    assert_eq!(ct_total(&engine.request(&ctkey("pkg", "root")).unwrap()), 125, "root now 100 + (20 + 5)");
+}
+
+#[test]
+fn editing_rule_impl_reevaluates_configured_target() {
+    // Editing the rule's IMPL (not its schema) must re-analyze: BZL_LOAD's value (the RuleDef schema) is
+    // unchanged, so CONFIGURED_TARGET's dependency on the rule .bzl's CONTENT (FILE) is what catches it.
+    let fs = Arc::new(MutFs::new());
+    let impl_v1 = b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
+        def _impl(ctx):\n\
+        \x20   return [NumberInfo(total = ctx.attr.value)]\n\
+        my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int()})\n";
+    fs.set("/w/pkg/rules.bzl", impl_v1, 1);
+    fs.set("/w/pkg/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\", value = 5)\n", 1);
+    let engine = build_analysis_engine(fs.clone(), HostPath::new("/w"));
+    assert_eq!(ct_total(&engine.request(&ctkey("pkg", "t")).unwrap()), 5);
+    let before = engine.version(&ctkey("pkg", "t")).unwrap();
+
+    // Same schema (value attr), different impl: total = value + 1000.
+    let impl_v2 = b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
+        def _impl(ctx):\n\
+        \x20   return [NumberInfo(total = ctx.attr.value + 1000)]\n\
+        my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int()})\n";
+    fs.set("/w/pkg/rules.bzl", impl_v2, 2);
+    engine.evaluate(&[ctkey("pkg", "t")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("pkg/rules.bzl")] });
+
+    let after = engine.version(&ctkey("pkg", "t")).unwrap();
+    assert!(after.last_changed > before.last_changed, "an impl edit re-analyzes (FILE content dep, not just BZL_LOAD schema)");
+    assert_eq!(ct_total(&engine.request(&ctkey("pkg", "t")).unwrap()), 1005, "the new impl ran");
+}
+
+#[test]
+fn analyze_target_without_rule_is_fail_closed() {
+    // A generic target() placeholder has no rule origin → there is no impl to run → Unsupported (never empty).
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/p/BUILD.bazel", b"target(kind = \"x\", name = \"t\")\n", 1);
+    let engine = build_analysis_engine(fs, HostPath::new("/w"));
+    assert!(
+        matches!(engine.request(&ctkey("p", "t")), Err(razel_core::Error::Unsupported { .. })),
+        "analyzing a target with no rule definition must fail closed (Unsupported)"
+    );
+}
+
+#[test]
+fn rule_impl_reaching_for_deferred_ctx_capability_fails_closed() {
+    // Deferred capabilities (ctx.actions / ctx.toolchains — execution + pitfall #4) are NOT on ctx yet. An impl
+    // that reaches for one must FAIL CLOSED (Starlark raises on a missing struct field), never silently get None.
+    let fs = Arc::new(MutFs::new());
+    fs.set(
+        "/w/pkg/rules.bzl",
+        b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
+          def _impl(ctx):\n\
+          \x20   x = ctx.actions\n\
+          \x20   return [NumberInfo(total = 0)]\n\
+          my_rule = rule(implementation = _impl, attrs = {})\n",
+        1,
+    );
+    fs.set("/w/pkg/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let engine = build_analysis_engine(fs, HostPath::new("/w"));
+    assert!(
+        engine.request(&ctkey("pkg", "t")).is_err(),
+        "reaching for an unprovided ctx capability must fail closed (loud), not silently yield None"
+    );
+}
+
+#[test]
+fn rule_bzl_with_load_fails_closed() {
+    // Threading the rule .bzl's own load()s into evaluate_rule is deferred (self-contained rule .bzls only). A
+    // rule .bzl that DOES load() must fail closed at analysis (empty loader → Eval error), never absorb to empty.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/helper.bzl", b"K = 7\n", 1);
+    fs.set(
+        "/w/pkg/rules.bzl",
+        b"load(\":helper.bzl\", \"K\")\n\
+          NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
+          def _impl(ctx):\n\
+          \x20   return [NumberInfo(total = K)]\n\
+          my_rule = rule(implementation = _impl, attrs = {})\n",
+        1,
+    );
+    fs.set("/w/pkg/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let engine = build_analysis_engine(fs, HostPath::new("/w"));
+    assert!(
+        engine.request(&ctkey("pkg", "t")).is_err(),
+        "a rule .bzl with its own load() must fail closed at analysis (deferred), not silently mis-evaluate"
+    );
+}
+
+#[test]
+fn configured_target_dep_cycle_is_detected() {
+    // a → b → a (via deps) must surface as a typed Cycle, inherited from the engine.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/rules.bzl", SUM_RULES, 1);
+    fs.set(
+        "/w/pkg/BUILD.bazel",
+        b"load(\":rules.bzl\", \"my_rule\")\n\
+          my_rule(name = \"a\", value = 1, deps = [\":b\"])\n\
+          my_rule(name = \"b\", value = 1, deps = [\":a\"])\n",
+        1,
+    );
+    let engine = build_analysis_engine(fs, HostPath::new("/w"));
+    assert!(
+        matches!(engine.request(&ctkey("pkg", "a")), Err(razel_core::Error::Cycle { .. })),
+        "a configured-target dependency cycle must be a typed Cycle error"
+    );
 }
