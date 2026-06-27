@@ -1,0 +1,18 @@
+[package]
+name = "razel-host"
+version = "0.1.0"
+edition = "2021"
+description = "razelv4 composition root: wires a System impl + the incremental Engine + source node-kinds (role: root)."
+
+[dependencies]
+razel-core = { path = "../razel-core", version = "0.1.0" }
+razel-ids = { path = "../razel-ids", version = "0.1.0" }
+razel-engine-api = { path = "../razel-engine-api", version = "0.1.0" }
+razel-engine = { path = "../razel-engine", version = "0.1.0" }   # IMPL — permitted: this is the composition root
+razel-os-api = { path = "../razel-os-api", version = "0.1.0" }
+razel-source = { path = "../razel-source", version = "0.1.0" }
+
+[features]
+# Pass-through so `cargo test -p razel-host --features mutant_file_hashes_stat` drives the source mutant
+# (turns the touch-cutoff integration test RED — red-first evidence for the stat≠content split).
+mutant_file_hashes_stat = ["razel-source/mutant_file_hashes_stat"]
