@@ -5,7 +5,9 @@
 
 use razel_core::{Digest, NodeKey, NodeValue};
 use razel_engine_api::{DemandEngine, Diff, FailurePolicy};
-use razel_bzl_api::{BzlValue, RuleOrigin};
+use razel_bzl_api::{BzlValue, ProviderId, ProviderInstance, RuleOrigin};
+use razel_host::build_analysis_engine_with_toolchains;
+use razel_toolchain::{Constraint, Platform, RegisteredToolchain, ToolchainType};
 use razel_host::{build_analysis_engine, build_loading_engine, build_source_engine};
 use razel_ids::RootRelativePath;
 use razel_load::{BzlLoadKey, BzlModuleValue};
@@ -99,6 +101,15 @@ fn ctkey(pkg: &str, name: &str) -> NodeKey {
         package: pkg.into(),
         name: name.into(),
         configuration: None,
+        exec_platform: None,
+        rule_transition: None,
+    })
+}
+fn ctkey_cfg(pkg: &str, name: &str, cfg: &str) -> NodeKey {
+    NodeKey::from_key(&ConfiguredTargetKey {
+        package: pkg.into(),
+        name: name.into(),
+        configuration: Some(cfg.into()),
         exec_platform: None,
         rule_transition: None,
     })
@@ -760,6 +771,69 @@ fn rule_bzl_with_load_fails_closed() {
     assert!(
         engine.request(&ctkey("pkg", "t")).is_err(),
         "a rule .bzl with its own load() must fail closed at analysis (deferred), not silently mis-evaluate"
+    );
+}
+
+// ──────────────── #4: toolchain resolution — the G4 exam (select by constraint, no fixture) ────────────────
+
+const TC_RULES: &[u8] = b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
+def _impl(ctx):\n\
+\x20   tc = ctx.toolchains[\"//cc:toolchain_type\"]\n\
+\x20   return [NumberInfo(total = tc.value)]\n\
+my_rule = rule(implementation = _impl, toolchains = [\"//cc:toolchain_type\"])\n";
+
+fn cc_toolchain(os: &str, value: i64) -> RegisteredToolchain {
+    RegisteredToolchain {
+        toolchain_type: ToolchainType("//cc:toolchain_type".into()),
+        target_compatible_with: vec![Constraint(format!("os:{os}"))],
+        info: ProviderInstance {
+            provider: ProviderId("CcInfo".into()),
+            fields: vec![("value".to_string(), BzlValue::Int(value))],
+        },
+    }
+}
+fn two_platforms() -> HashMap<String, Platform> {
+    let mut m = HashMap::new();
+    m.insert("p_linux".to_string(), Platform { constraints: vec![Constraint("os:linux".into())] });
+    m.insert("p_macos".to_string(), Platform { constraints: vec![Constraint("os:macos".into())] });
+    m
+}
+
+#[test]
+fn toolchain_resolves_by_platform_g4_exam() {
+    // THE G4 exam over the engine: a rule requires a toolchain type; two toolchains are registered (linux/macos)
+    // differing only by their target constraint; the resolved ctx.toolchains[type] — hence the rule's output —
+    // FLIPS with the target platform (the CONFIGURATION key). Data-driven selection, NO host fixture.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let engine = build_analysis_engine_with_toolchains(
+        fs,
+        HostPath::new("/w"),
+        vec![cc_toolchain("linux", 1), cc_toolchain("macos", 2)],
+        two_platforms(),
+    );
+    assert_eq!(ct_total(&engine.request(&ctkey_cfg("app", "t", "p_linux")).unwrap()), 1, "linux platform → linux cc (value 1)");
+    assert_eq!(
+        ct_total(&engine.request(&ctkey_cfg("app", "t", "p_macos")).unwrap()),
+        2,
+        "flip the target platform → the resolved toolchain flips (value 2) — data-driven, no fixture"
+    );
+}
+
+#[test]
+fn rule_requiring_unavailable_toolchain_is_fail_closed() {
+    // A rule requires a cc toolchain, but the target platform has no compatible one → fail closed (never a
+    // default/fixture), and the failure propagates to the configured target.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let mut platforms = HashMap::new();
+    platforms.insert("p_windows".to_string(), Platform { constraints: vec![Constraint("os:windows".into())] });
+    let engine = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), vec![cc_toolchain("linux", 1)], platforms);
+    assert!(
+        engine.request(&ctkey_cfg("app", "t", "p_windows")).is_err(),
+        "no cc toolchain compatible with the platform → the configured target fails closed"
     );
 }
 
