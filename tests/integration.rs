@@ -5,8 +5,10 @@
 
 use razel_core::{Digest, NodeKey, NodeValue};
 use razel_engine_api::{DemandEngine, Diff, FailurePolicy};
-use razel_host::build_source_engine;
+use razel_bzl_api::BzlValue;
+use razel_host::{build_loading_engine, build_source_engine};
 use razel_ids::RootRelativePath;
+use razel_load::{BzlLoadKey, BzlModuleValue};
 use razel_os_api::{
     EnvName, ExitStatus, FileKind, HostPath, Metadata, OsError, OsPathFragment, OsPathPolicy, OsValue,
     ProcessSpec, RawSymlinkTarget, System,
@@ -84,6 +86,10 @@ fn dlkey(p: &str) -> NodeKey { NodeKey::from_key(&DirListingKey(RootRelativePath
 fn gkey(dir: &str, pat: &str) -> NodeKey { NodeKey::from_key(&GlobKey { dir: RootRelativePath(dir.into()), pattern: pat.into() }) }
 fn fval(v: &NodeValue) -> FileValue { v.as_any().downcast_ref::<FileValue>().unwrap().clone() }
 fn gmatch(v: &NodeValue) -> Vec<String> { v.as_any().downcast_ref::<GlobMatch>().unwrap().0.clone() }
+fn bkey(p: &str) -> NodeKey { NodeKey::from_key(&BzlLoadKey(RootRelativePath(p.into()))) }
+fn bget(v: &NodeValue, name: &str) -> Option<BzlValue> {
+    v.as_any().downcast_ref::<BzlModuleValue>().unwrap().0.get(name).cloned()
+}
 
 #[test]
 fn file_reflects_content() {
@@ -236,4 +242,49 @@ fn root_dir_glob_finds_root_files() {
         vec!["x.txt".to_string(), "y.txt".to_string()],
         "a glob at the workspace root (dir==\"\") lists root files, root-relative, not nested ones"
     );
+}
+
+// ──────────────── BZL_LOAD: a Starlark .bzl as an incremental node (the spike) ────────────────
+
+#[test]
+fn bzl_evaluates_as_a_node() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/rules.bzl", b"x = 1 + 2\ny = \"hi\"\nz = [True, 4]\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    let v = engine.request(&bkey("rules.bzl")).unwrap();
+    assert_eq!(bget(&v, "x"), Some(BzlValue::Int(3)), "starlark arithmetic folds: 1 + 2 = 3");
+    assert_eq!(bget(&v, "y"), Some(BzlValue::Str("hi".into())));
+    assert_eq!(bget(&v, "z"), Some(BzlValue::List(vec![BzlValue::Bool(true), BzlValue::Int(4)])));
+}
+
+#[test]
+fn editing_bzl_reevaluates() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/rules.bzl", b"x = 1\n", 1);
+    let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&bkey("rules.bzl")).unwrap(); // warm
+    let before = engine.version(&bkey("rules.bzl")).unwrap();
+
+    fs.set("/w/rules.bzl", b"x = 99\n", 2); // genuine source change
+    engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("rules.bzl")] });
+
+    let after = engine.version(&bkey("rules.bzl")).unwrap();
+    assert!(after.last_changed > before.last_changed, "a .bzl source change re-evaluates BZL_LOAD");
+    assert_eq!(bget(&engine.request(&bkey("rules.bzl")).unwrap(), "x"), Some(BzlValue::Int(99)));
+}
+
+#[test]
+fn touching_bzl_does_not_reevaluate() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/rules.bzl", b"x = 1\n", 1);
+    let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&bkey("rules.bzl")).unwrap(); // warm
+    let before = engine.version(&bkey("rules.bzl")).unwrap();
+
+    fs.set("/w/rules.bzl", b"x = 1\n", 999); // TOUCH: new mtime, identical source bytes
+    engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("rules.bzl")] });
+
+    let after = engine.version(&bkey("rules.bzl")).unwrap();
+    assert_eq!(after.last_changed, before.last_changed, "a touch (same bytes) must NOT re-parse the .bzl — the FILE content-cutoff propagates");
+    assert!(after.last_evaluated > before.last_evaluated, "BZL_LOAD is re-checked this round, just not recomputed");
 }

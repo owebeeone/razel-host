@@ -11,6 +11,9 @@ razel-engine-api = { path = "../razel-engine-api", version = "0.1.0" }
 razel-engine = { path = "../razel-engine", version = "0.1.0" }   # IMPL — permitted: this is the composition root
 razel-os-api = { path = "../razel-os-api", version = "0.1.0" }
 razel-source = { path = "../razel-source", version = "0.1.0" }
+razel-load = { path = "../razel-load", version = "0.1.0" }
+razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
+razel-bzl-starlark = { path = "../razel-bzl-starlark", version = "0.1.0" }  # IMPL — permitted: composition root
 
 [features]
 # Pass-through so `cargo test -p razel-host --features mutant_file_hashes_stat` drives the source mutant
