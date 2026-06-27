@@ -11,7 +11,7 @@ use razel_os_api::{
     EnvName, ExitStatus, FileKind, HostPath, Metadata, OsError, OsPathFragment, OsPathPolicy, OsValue,
     ProcessSpec, RawSymlinkTarget, System,
 };
-use razel_source::{FileKey, FileStateKey, FileValue};
+use razel_source::{DirListingKey, FileKey, FileStateKey, FileValue, GlobKey, GlobMatch};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +36,9 @@ impl MutFs {
     fn set(&self, path: &str, content: &[u8], mtime: i128) {
         self.files.lock().unwrap().insert(path.into(), (content.to_vec(), mtime));
     }
+    fn remove(&self, path: &str) {
+        self.files.lock().unwrap().remove(path);
+    }
 }
 impl System for MutFs {
     fn read(&self, p: &HostPath) -> Result<Vec<u8>, OsError> {
@@ -52,8 +55,16 @@ impl System for MutFs {
         Ok(Metadata { kind: FileKind::File, len: c.len() as u64, mtime_nanos: *mtime, file_id: 0 })
     }
     fn lstat(&self, p: &HostPath) -> Result<Metadata, OsError> { self.stat(p) }
-    fn list_dir(&self, _p: &HostPath) -> Result<Vec<OsPathFragment>, OsError> {
-        Err(OsError::Unsupported { op: "list_dir", detail: "test".into() })
+    fn list_dir(&self, p: &HostPath) -> Result<Vec<OsPathFragment>, OsError> {
+        let prefix = format!("{}/", p.as_str());
+        let g = self.files.lock().unwrap();
+        let mut out: Vec<OsPathFragment> = g
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).filter(|r| !r.contains('/')))
+            .map(OsPathFragment::new_unchecked)
+            .collect();
+        out.sort_by(|a, b| a.as_str().as_bytes().cmp(b.as_str().as_bytes()));
+        Ok(out)
     }
     fn read_link(&self, p: &HostPath) -> Result<RawSymlinkTarget, OsError> {
         Err(OsError::NotFound { path: p.as_str().into() })
@@ -69,7 +80,10 @@ impl System for MutFs {
 // ──────────────── helpers ────────────────
 fn fkey(p: &str) -> NodeKey { NodeKey::from_key(&FileKey(RootRelativePath(p.into()))) }
 fn fskey(p: &str) -> NodeKey { NodeKey::from_key(&FileStateKey(RootRelativePath(p.into()))) }
+fn dlkey(p: &str) -> NodeKey { NodeKey::from_key(&DirListingKey(RootRelativePath(p.into()))) }
+fn gkey(dir: &str, pat: &str) -> NodeKey { NodeKey::from_key(&GlobKey { dir: RootRelativePath(dir.into()), pattern: pat.into() }) }
 fn fval(v: &NodeValue) -> FileValue { v.as_any().downcast_ref::<FileValue>().unwrap().clone() }
+fn gmatch(v: &NodeValue) -> Vec<String> { v.as_any().downcast_ref::<GlobMatch>().unwrap().0.clone() }
 
 #[test]
 fn file_reflects_content() {
@@ -122,4 +136,104 @@ fn touch_without_content_change_is_cut_off() {
     assert!(as_.last_changed > bs.last_changed, "stat (mtime) changed → FILE_STATE advances");
     assert_eq!(af.last_changed, bf.last_changed, "content identical → FILE early-cutoff (no propagation)");
     assert!(af.last_evaluated > bf.last_evaluated, "but FILE was re-evaluated (re-read) this round");
+}
+
+#[test]
+fn glob_lists_matching_files() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/src/a.txt", b"a", 1);
+    fs.set("/w/src/b.txt", b"b", 1);
+    fs.set("/w/src/c.rs", b"c", 1);
+    let engine = build_source_engine(fs, HostPath::new("/w"));
+    assert_eq!(
+        gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()),
+        vec!["src/a.txt".to_string(), "src/b.txt".to_string()],
+        "glob matches *.txt, sorted, root-relative; c.rs excluded"
+    );
+}
+
+#[test]
+fn adding_a_file_reexpands_glob() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/src/a.txt", b"a", 1);
+    fs.set("/w/src/b.txt", b"b", 1);
+    let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&gkey("src", "*.txt")).unwrap(); // warm
+    let before = engine.version(&gkey("src", "*.txt")).unwrap();
+
+    fs.set("/w/src/d.txt", b"d", 1); // a new matching file appears in the directory
+    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![dlkey("src")] });
+
+    let after = engine.version(&gkey("src", "*.txt")).unwrap();
+    assert!(after.last_changed > before.last_changed, "a new matching file re-expands the glob");
+    assert_eq!(
+        gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()),
+        vec!["src/a.txt".to_string(), "src/b.txt".to_string(), "src/d.txt".to_string()]
+    );
+}
+
+#[test]
+fn content_change_does_not_disturb_glob() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/src/a.txt", b"a", 1);
+    fs.set("/w/src/b.txt", b"b", 1);
+    let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&gkey("src", "*.txt")).unwrap(); // warm
+
+    // A matched file's CONTENT changes — but the directory's entry set does not. The glob is about WHICH
+    // files exist, not their bytes, so it must not even be revisited (it never depends on file content).
+    fs.set("/w/src/a.txt", b"a-changed-bigger", 2);
+    let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("src/a.txt")] });
+
+    assert_eq!(rep.recomputes, 0, "a file-content change must not recompute the glob (no content dependency)");
+}
+
+#[test]
+fn over_broad_listing_invalidation_still_cuts_off_glob() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/src/a.txt", b"a", 1);
+    fs.set("/w/src/b.txt", b"b", 1);
+    let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&gkey("src", "*.txt")).unwrap(); // warm
+    let g_before = engine.version(&gkey("src", "*.txt")).unwrap();
+    let d_before = engine.version(&dlkey("src")).unwrap();
+
+    // An over-broad monitor re-dirties the whole DIRECTORY_LISTING on a mere mtime change, but the entry
+    // (name, is_dir) set is identical → the listing value is unchanged → the glob is pruned by cutoff.
+    fs.set("/w/src/a.txt", b"a", 999);
+    let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![dlkey("src")] });
+
+    let g_after = engine.version(&gkey("src", "*.txt")).unwrap();
+    let d_after = engine.version(&dlkey("src")).unwrap();
+    assert_eq!(rep.recomputes, 1, "only DIRECTORY_LISTING recomputes; the glob is pruned");
+    assert_eq!(d_after.last_changed, d_before.last_changed, "listing value-equal → last_changed not advanced");
+    assert_eq!(g_after.last_changed, g_before.last_changed, "glob cut off → last_changed unchanged");
+}
+
+#[test]
+fn removing_a_file_shrinks_glob() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/src/a.txt", b"a", 1);
+    fs.set("/w/src/b.txt", b"b", 1);
+    let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
+    assert_eq!(gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()), vec!["src/a.txt".to_string(), "src/b.txt".to_string()]);
+
+    fs.remove("/w/src/a.txt"); // a matching file disappears
+    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![dlkey("src")] });
+
+    assert_eq!(gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()), vec!["src/b.txt".to_string()], "removing a file shrinks the glob");
+}
+
+#[test]
+fn root_dir_glob_finds_root_files() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/x.txt", b"x", 1);
+    fs.set("/w/y.txt", b"y", 1);
+    fs.set("/w/sub/z.txt", b"z", 1); // nested → not a root-level entry
+    let engine = build_source_engine(fs, HostPath::new("/w"));
+    assert_eq!(
+        gmatch(&engine.request(&gkey("", "*.txt")).unwrap()),
+        vec!["x.txt".to_string(), "y.txt".to_string()],
+        "a glob at the workspace root (dir==\"\") lists root files, root-relative, not nested ones"
+    );
 }
