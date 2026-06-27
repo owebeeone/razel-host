@@ -18,7 +18,11 @@ use razel_os_api::{
     ProcessSpec, RawSymlinkTarget, System,
 };
 use razel_source::{DirListingKey, FileKey, FileStateKey, FileValue, GlobKey, GlobMatch};
-use std::collections::HashMap;
+use razel_action::{action_key_from_template, ActionValue};
+use razel_exec_api::conformance::{fake_output_content, DroppingStrategy, FakeStrategy};
+use razel_exec_api::SpawnRequest;
+use razel_host::build_execution_engine;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 // ──────────────── a mutable in-memory System (only stat/read carry real logic) ────────────────
@@ -120,6 +124,12 @@ fn ct_total(v: &NodeValue) -> i64 {
         Some(BzlValue::Int(i)) => *i,
         other => panic!("expected NumberInfo.total: int, got {other:?}"),
     }
+}
+fn configured_target(v: &NodeValue) -> ConfiguredTarget {
+    v.as_any().downcast_ref::<ConfiguredTarget>().unwrap().clone()
+}
+fn action_value(v: &NodeValue) -> ActionValue {
+    v.as_any().downcast_ref::<ActionValue>().unwrap().clone()
 }
 
 // The sum-provider rule (the de-nativized-rule exam): a target's NumberInfo.total = its own value + the sum of
@@ -834,6 +844,72 @@ fn rule_requiring_unavailable_toolchain_is_fail_closed() {
     assert!(
         engine.request(&ctkey_cfg("app", "t", "p_windows")).is_err(),
         "no cc toolchain compatible with the platform → the configured target fails closed"
+    );
+}
+
+// ──────────────── #5: execution — a rule's declared action runs through the SpawnStrategy seam ────────────────
+
+const ACTION_RULES: &[u8] = b"NumberInfo = provider(\"NumberInfo\", fields = [\"x\"])\n\
+def _impl(ctx):\n\
+\x20   declare_action(mnemonic = \"Compile\", argv = [\"cc\", \"-o\", \"out\"], outputs = [\"out\"])\n\
+\x20   return [NumberInfo(x = 1)]\n\
+my_rule = rule(implementation = _impl, attrs = {})\n";
+
+#[test]
+fn rule_declared_action_executes_over_the_engine() {
+    // THE execution exam (#5): a rule declares an action; the configured target carries it; turning it into an
+    // ACTION node runs it THROUGH the SpawnStrategy seam, producing the declared output — end-to-end over the one
+    // incremental engine, then cached on re-evaluation. The strategy is a HOST choice (fake here; local/remote
+    // behind the same seam) with no consumer rewrite.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", ACTION_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let engine = build_execution_engine(fs, HostPath::new("/w"), Arc::new(FakeStrategy));
+
+    // analysis: the configured target carries exactly the declared action template.
+    let ct = configured_target(&engine.request(&ctkey("app", "t")).unwrap());
+    assert_eq!(ct.actions.len(), 1, "the rule's declared action surfaces on the configured target");
+    let tmpl = ct.actions[0].clone();
+    assert_eq!(tmpl.mnemonic, "Compile");
+    assert_eq!(tmpl.outputs, vec!["out".to_string()]);
+
+    // execution: turn the template into an ACTION key (no inputs — the minimal cut) and run it over the engine.
+    let key = action_key_from_template(&tmpl, vec![]);
+    let akey = NodeKey::from_key(&key);
+    let val = action_value(&engine.request(&akey).unwrap());
+    assert_eq!(val.exit_code, 0, "the action ran via the strategy and exited zero");
+
+    // it really went THROUGH the strategy: the output digest is the FakeStrategy's deterministic content, not a
+    // fabricated/empty one.
+    let out = val.output("out").expect("the declared output was produced");
+    let req = SpawnRequest::new(
+        "Compile",
+        vec!["cc".into(), "-o".into(), "out".into()],
+        BTreeMap::new(),
+        vec![],
+        vec!["out".to_string()],
+    );
+    assert_eq!(out.digest, Digest::of(&fake_output_content(&req, "out")), "the ACTION output IS the strategy's output");
+
+    // incremental: re-evaluating with no relevant change does not re-run the action (content-keyed cutoff).
+    let rep = engine.evaluate(&[akey], FailurePolicy::FailFast, &Diff { changed_leaves: vec![] });
+    assert_eq!(rep.recomputes, 0, "an unchanged action is not re-executed");
+}
+
+#[test]
+fn action_with_dropped_output_is_fail_closed() {
+    // The strategy that drops the declared output → the ACTION node surfaces the failure (declared-output check),
+    // never a silent empty success. Same rule, same wiring — only the host's strategy choice changes.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", ACTION_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let engine = build_execution_engine(fs, HostPath::new("/w"), Arc::new(DroppingStrategy { drop: "out".into() }));
+
+    let ct = configured_target(&engine.request(&ctkey("app", "t")).unwrap());
+    let key = action_key_from_template(&ct.actions[0], vec![]);
+    assert!(
+        engine.request(&NodeKey::from_key(&key)).is_err(),
+        "a strategy that drops the declared output must fail the action closed"
     );
 }
 

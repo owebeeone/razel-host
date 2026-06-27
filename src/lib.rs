@@ -6,6 +6,7 @@
 use razel_bzl_api::BzlEvaluator;
 use razel_bzl_starlark::StarlarkEvaluator;
 use razel_engine::Engine;
+use razel_exec_api::SpawnStrategy;
 use razel_os_api::{HostPath, System};
 use razel_toolchain::{Platform, RegisteredToolchain};
 use std::collections::HashMap;
@@ -54,5 +55,15 @@ pub fn build_analysis_engine_with_toolchains(
     razel_package::register_package_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
     razel_analysis::register_analysis_kinds(&mut engine, sys, root, eval);
     razel_toolchain::register_toolchain_kinds(&mut engine, registered, platforms);
+    engine
+}
+
+/// Build an `Engine` spanning loading, analysis AND execution: source → `.bzl` → `CONFIGURED_TARGET` → `ACTION`.
+/// A rule's declared actions (`RuleResult.actions`, carried on the configured target) become `ACTION` nodes that
+/// run through the supplied `SpawnStrategy` (local/sandbox/remote behind the one seam — the fake/local/remote
+/// choice is a host decision, with no consumer rewrite). Toolchains are wired as in `build_analysis_engine`.
+pub fn build_execution_engine(sys: Arc<dyn System>, root: HostPath, strategy: Arc<dyn SpawnStrategy>) -> Engine {
+    let mut engine = build_analysis_engine(sys, root);
+    razel_action::register_action_kinds(&mut engine, strategy);
     engine
 }
