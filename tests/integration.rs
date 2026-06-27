@@ -832,6 +832,26 @@ fn toolchain_resolves_by_platform_g4_exam() {
 }
 
 #[test]
+fn toolchain_requiring_target_without_configuration_is_fail_closed() {
+    // A toolchain-requiring target whose configuration is None must FAIL CLOSED — even when a "" (empty-name)
+    // platform IS registered. The bug this guards: coercing a missing configuration to the empty platform name
+    // (`unwrap_or_default()`) so the target silently resolves against whatever "" platform exists (an Absorb —
+    // a missing key dimension becoming a default value). Here a "" platform with a compatible cc toolchain is
+    // registered on purpose; correct behavior is still an error, because the target itself has no configuration.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let mut platforms = HashMap::new();
+    platforms.insert("".to_string(), Platform { constraints: vec![Constraint("os:linux".into())] });
+    let engine = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), vec![cc_toolchain("linux", 1)], platforms);
+    // `ctkey` (not `ctkey_cfg`) → configuration is None.
+    assert!(
+        engine.request(&ctkey("app", "t")).is_err(),
+        "a toolchain-requiring target with no configuration must fail closed, not resolve against a default \"\" platform"
+    );
+}
+
+#[test]
 fn rule_requiring_unavailable_toolchain_is_fail_closed() {
     // A rule requires a cc toolchain, but the target platform has no compatible one → fail closed (never a
     // default/fixture), and the failure propagates to the configured target.
@@ -857,10 +877,12 @@ my_rule = rule(implementation = _impl, attrs = {})\n";
 
 #[test]
 fn rule_declared_action_executes_over_the_engine() {
-    // THE execution exam (#5): a rule declares an action; the configured target carries it; turning it into an
-    // ACTION node runs it THROUGH the SpawnStrategy seam, producing the declared output — end-to-end over the one
-    // incremental engine, then cached on re-evaluation. The strategy is a HOST choice (fake here; local/remote
-    // behind the same seam) with no consumer rewrite.
+    // THE execution exam (#5): a rule declares an action; the configured target carries it as a template; we turn
+    // that template into an ACTION key (action_key_from_template) and request the ACTION node, which runs it
+    // THROUGH the SpawnStrategy seam, producing the declared output, then cached on re-evaluation. NOTE: the
+    // CONFIGURED_TARGET → ACTION link is BRIDGED HERE BY HAND — there is no automatic demand edge yet (that is the
+    // deferred artifact-materializer step); this proves the seam + node + cutoff, not an engine-driven CT→ACTION
+    // edge. The strategy is a HOST choice (fake here; local/remote behind the same seam) with no consumer rewrite.
     let fs = Arc::new(MutFs::new());
     fs.set("/w/app/rules.bzl", ACTION_RULES, 1);
     fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);

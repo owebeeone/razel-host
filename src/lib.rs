@@ -58,10 +58,13 @@ pub fn build_analysis_engine_with_toolchains(
     engine
 }
 
-/// Build an `Engine` spanning loading, analysis AND execution: source → `.bzl` → `CONFIGURED_TARGET` → `ACTION`.
-/// A rule's declared actions (`RuleResult.actions`, carried on the configured target) become `ACTION` nodes that
-/// run through the supplied `SpawnStrategy` (local/sandbox/remote behind the one seam — the fake/local/remote
-/// choice is a host decision, with no consumer rewrite). Toolchains are wired as in `build_analysis_engine`.
+/// Build an `Engine` registering loading, analysis AND the execution node-kind: source → `.bzl` →
+/// `CONFIGURED_TARGET`, plus `ACTION` over the supplied `SpawnStrategy` (local/sandbox/remote behind the one seam
+/// — a host decision, no consumer rewrite). NOTE: there is no automatic `CONFIGURED_TARGET → ACTION` demand edge
+/// yet — a rule's declared actions ride on the configured target as templates (`RuleResult.actions`), and the
+/// caller turns each into an `ACTION` node via `razel_action::action_key_from_template`. Wiring that edge (and
+/// resolving input PATHS → producer-output digests) is the deferred artifact-materializer step. Toolchains are
+/// wired as in `build_analysis_engine`.
 pub fn build_execution_engine(sys: Arc<dyn System>, root: HostPath, strategy: Arc<dyn SpawnStrategy>) -> Engine {
     let mut engine = build_analysis_engine(sys, root);
     razel_action::register_action_kinds(&mut engine, strategy);

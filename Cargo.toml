@@ -29,3 +29,6 @@ mutant_package_allow_dup_names = ["razel-bzl-starlark/mutant_package_allow_dup_n
 mutant_ct_drops_config = ["razel-analysis/mutant_ct_drops_config"]
 mutant_ct_skips_rule_file_dep = ["razel-analysis/mutant_ct_skips_rule_file_dep"]
 mutant_ct_drops_toolchains = ["razel-analysis/mutant_ct_drops_toolchains"]
+mutant_ct_absorbs_missing_config = ["razel-analysis/mutant_ct_absorbs_missing_config"]
+mutant_exec_hardcodes_output = ["razel-action/mutant_exec_hardcodes_output"]
+mutant_toolchain_ignores_constraints = ["razel-toolchain/mutant_toolchain_ignores_constraints"]
