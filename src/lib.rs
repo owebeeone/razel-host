@@ -17,12 +17,14 @@ pub fn build_source_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
     engine
 }
 
-/// Build an `Engine` with the source-graph kinds AND the loading kind (`BZL_LOAD`), wiring the real
-/// Starlark evaluator. This is the first assembly that spans the OS seam, the engine, and the Starlark seam.
+/// Build an `Engine` with the source-graph kinds AND the loading kinds (`BZL_LOAD` + `PACKAGE`), wiring the
+/// real Starlark evaluator. This is the assembly that spans the OS seam, the engine, and the Starlark seam:
+/// source files → `.bzl` modules → packages of targets, all on the one incremental engine.
 pub fn build_loading_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
     let mut engine = Engine::new();
     razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone());
     let eval: Arc<dyn BzlEvaluator> = Arc::new(StarlarkEvaluator::new());
-    razel_load::register_load_kinds(&mut engine, sys, root, eval);
+    razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
+    razel_package::register_package_kinds(&mut engine, sys, root, eval);
     engine
 }
