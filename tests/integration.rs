@@ -288,3 +288,101 @@ fn touching_bzl_does_not_reevaluate() {
     assert_eq!(after.last_changed, before.last_changed, "a touch (same bytes) must NOT re-parse the .bzl — the FILE content-cutoff propagates");
     assert!(after.last_evaluated > before.last_evaluated, "BZL_LOAD is re-checked this round, just not recomputed");
 }
+
+#[test]
+fn load_resolves_across_bzls() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/b.bzl", b"y = 40\n", 1);
+    fs.set("/w/pkg/a.bzl", b"load(\":b.bzl\", \"y\")\nx = y + 2\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    let v = engine.request(&bkey("pkg/a.bzl")).unwrap();
+    assert_eq!(bget(&v, "x"), Some(BzlValue::Int(42)), "a.bzl loads y=40 from b.bzl: x = y + 2 = 42");
+}
+
+#[test]
+fn editing_loaded_bzl_propagates_to_loader() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/b.bzl", b"y = 40\n", 1);
+    fs.set("/w/pkg/a.bzl", b"load(\":b.bzl\", \"y\")\nx = y + 2\n", 1);
+    let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&bkey("pkg/a.bzl")).unwrap(); // warm: BZL_LOAD(a) now depends on BZL_LOAD(b)
+    let before = engine.version(&bkey("pkg/a.bzl")).unwrap();
+
+    fs.set("/w/pkg/b.bzl", b"y = 100\n", 2); // edit the LOADED .bzl, not the loader
+    engine.evaluate(&[bkey("pkg/a.bzl")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("pkg/b.bzl")] });
+
+    let after = engine.version(&bkey("pkg/a.bzl")).unwrap();
+    assert!(after.last_changed > before.last_changed, "editing a loaded .bzl re-evaluates its loader (transitive through the load graph)");
+    assert_eq!(bget(&engine.request(&bkey("pkg/a.bzl")).unwrap(), "x"), Some(BzlValue::Int(102)));
+}
+
+#[test]
+fn load_cycle_is_detected() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/a.bzl", b"load(\":b.bzl\", \"y\")\nx = 1\n", 1);
+    fs.set("/w/pkg/b.bzl", b"load(\":a.bzl\", \"x\")\ny = 1\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    assert!(
+        matches!(engine.request(&bkey("pkg/a.bzl")), Err(razel_core::Error::Cycle { .. })),
+        "an a→b→a load() cycle must surface as a typed Cycle error"
+    );
+}
+
+#[test]
+fn self_load_is_detected() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/a.bzl", b"load(\":a.bzl\", \"x\")\ny = 1\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    assert!(
+        matches!(engine.request(&bkey("a.bzl")), Err(razel_core::Error::Cycle { .. })),
+        "a self-load (a.bzl loads \":a.bzl\") must be detected as a cycle"
+    );
+}
+
+#[test]
+fn unsupported_load_form_is_rejected() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/a.bzl", b"load(\"//other:f.bzl\", \"z\")\nx = 1\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    assert!(
+        matches!(engine.request(&bkey("pkg/a.bzl")), Err(razel_core::Error::Unsupported { .. })),
+        "a Bazel-label load form must fail loudly (Unsupported), never silently mis-resolve to a wrong path"
+    );
+}
+
+#[test]
+fn nonexistent_loaded_bzl_errors() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/pkg/a.bzl", b"load(\":ghost.bzl\", \"z\")\nx = 1\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    assert!(
+        matches!(engine.request(&bkey("pkg/a.bzl")), Err(razel_core::Error::NotFound { .. })),
+        "loading a nonexistent .bzl must surface a typed NotFound, not a silent empty"
+    );
+}
+
+#[test]
+fn loaded_symbol_not_reexported_across_three_bzls() {
+    // d.bzl defines z; a.bzl loads z; c.bzl tries to load z FROM a — must fail (a does not re-export z).
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/p/d.bzl", b"z = 5\n", 1);
+    fs.set("/w/p/a.bzl", b"load(\":d.bzl\", \"z\")\nq = z\n", 1);
+    fs.set("/w/p/c.bzl", b"load(\":a.bzl\", \"z\")\nbad = z\n", 1); // z is NOT exported by a
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    assert!(
+        engine.request(&bkey("p/c.bzl")).is_err(),
+        "c.bzl must NOT be able to load z transitively from a.bzl — load()ed symbols are not re-exported"
+    );
+}
+
+#[test]
+fn diamond_load_resolves_shared_dep() {
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/p/d.bzl", b"z = 100\n", 1);
+    fs.set("/w/p/b.bzl", b"load(\":d.bzl\", \"z\")\nx = z + 1\n", 1);
+    fs.set("/w/p/c.bzl", b"load(\":d.bzl\", \"z\")\ny = z + 2\n", 1);
+    fs.set("/w/p/a.bzl", b"load(\":b.bzl\", \"x\")\nload(\":c.bzl\", \"y\")\nresult = x + y\n", 1);
+    let engine = build_loading_engine(fs, HostPath::new("/w"));
+    let v = engine.request(&bkey("p/a.bzl")).unwrap();
+    assert_eq!(bget(&v, "result"), Some(BzlValue::Int(203)), "diamond (a→b,c→d): shared d resolves once, no false cycle (x=101, y=102)");
+}
