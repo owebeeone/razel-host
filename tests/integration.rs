@@ -4,7 +4,7 @@
 //! re-stats and re-reads, but the content digest is unchanged, so the rebuild stops at `FILE`.**
 
 use razel_core::{Digest, NodeKey, NodeValue};
-use razel_engine_api::{DemandEngine, Diff, FailurePolicy};
+use razel_engine_api::{ChangedLeaf, DemandEngine, Diff, FailurePolicy};
 use razel_bzl_api::{BzlValue, ProviderId, ProviderInstance, RuleOrigin};
 use razel_host::build_analysis_engine_with_toolchains;
 use razel_toolchain::{Constraint, Platform, RegisteredToolchain, ToolchainType};
@@ -166,12 +166,12 @@ fn content_change_propagates() {
     fs.set("/w/a.txt", b"v1", 100);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&fkey("a.txt")).unwrap(); // warm
-    let before = engine.version(&fkey("a.txt")).unwrap();
+    let before = engine.inspect(&fkey("a.txt")).unwrap();
 
     fs.set("/w/a.txt", b"v2-different", 200); // genuine content change (mtime too)
-    engine.evaluate(&[fkey("a.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("a.txt")] });
+    engine.evaluate(&[fkey("a.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("a.txt"))] });
 
-    let after = engine.version(&fkey("a.txt")).unwrap();
+    let after = engine.inspect(&fkey("a.txt")).unwrap();
     assert!(after.last_changed > before.last_changed, "content changed → FILE propagates");
     assert_eq!(fval(&engine.request(&fkey("a.txt")).unwrap()).content, Digest::of(b"v2-different"));
 }
@@ -182,14 +182,14 @@ fn touch_without_content_change_is_cut_off() {
     fs.set("/w/a.txt", b"same", 100);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&fkey("a.txt")).unwrap(); // warm
-    let bf = engine.version(&fkey("a.txt")).unwrap();
-    let bs = engine.version(&fskey("a.txt")).unwrap();
+    let bf = engine.inspect(&fkey("a.txt")).unwrap();
+    let bs = engine.inspect(&fskey("a.txt")).unwrap();
 
     fs.set("/w/a.txt", b"same", 999); // TOUCH: new mtime, identical content
-    engine.evaluate(&[fkey("a.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("a.txt")] });
+    engine.evaluate(&[fkey("a.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("a.txt"))] });
 
-    let af = engine.version(&fkey("a.txt")).unwrap();
-    let as_ = engine.version(&fskey("a.txt")).unwrap();
+    let af = engine.inspect(&fkey("a.txt")).unwrap();
+    let as_ = engine.inspect(&fskey("a.txt")).unwrap();
     assert!(as_.last_changed > bs.last_changed, "stat (mtime) changed → FILE_STATE advances");
     assert_eq!(af.last_changed, bf.last_changed, "content identical → FILE early-cutoff (no propagation)");
     assert!(af.last_evaluated > bf.last_evaluated, "but FILE was re-evaluated (re-read) this round");
@@ -216,12 +216,12 @@ fn adding_a_file_reexpands_glob() {
     fs.set("/w/src/b.txt", b"b", 1);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&gkey("src", "*.txt")).unwrap(); // warm
-    let before = engine.version(&gkey("src", "*.txt")).unwrap();
+    let before = engine.inspect(&gkey("src", "*.txt")).unwrap();
 
     fs.set("/w/src/d.txt", b"d", 1); // a new matching file appears in the directory
-    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![dlkey("src")] });
+    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(dlkey("src"))] });
 
-    let after = engine.version(&gkey("src", "*.txt")).unwrap();
+    let after = engine.inspect(&gkey("src", "*.txt")).unwrap();
     assert!(after.last_changed > before.last_changed, "a new matching file re-expands the glob");
     assert_eq!(
         gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()),
@@ -240,7 +240,7 @@ fn content_change_does_not_disturb_glob() {
     // A matched file's CONTENT changes — but the directory's entry set does not. The glob is about WHICH
     // files exist, not their bytes, so it must not even be revisited (it never depends on file content).
     fs.set("/w/src/a.txt", b"a-changed-bigger", 2);
-    let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("src/a.txt")] });
+    let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("src/a.txt"))] });
 
     assert_eq!(rep.recomputes, 0, "a file-content change must not recompute the glob (no content dependency)");
 }
@@ -252,16 +252,16 @@ fn over_broad_listing_invalidation_still_cuts_off_glob() {
     fs.set("/w/src/b.txt", b"b", 1);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&gkey("src", "*.txt")).unwrap(); // warm
-    let g_before = engine.version(&gkey("src", "*.txt")).unwrap();
-    let d_before = engine.version(&dlkey("src")).unwrap();
+    let g_before = engine.inspect(&gkey("src", "*.txt")).unwrap();
+    let d_before = engine.inspect(&dlkey("src")).unwrap();
 
     // An over-broad monitor re-dirties the whole DIRECTORY_LISTING on a mere mtime change, but the entry
     // (name, is_dir) set is identical → the listing value is unchanged → the glob is pruned by cutoff.
     fs.set("/w/src/a.txt", b"a", 999);
-    let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![dlkey("src")] });
+    let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(dlkey("src"))] });
 
-    let g_after = engine.version(&gkey("src", "*.txt")).unwrap();
-    let d_after = engine.version(&dlkey("src")).unwrap();
+    let g_after = engine.inspect(&gkey("src", "*.txt")).unwrap();
+    let d_after = engine.inspect(&dlkey("src")).unwrap();
     assert_eq!(rep.recomputes, 1, "only DIRECTORY_LISTING recomputes; the glob is pruned");
     assert_eq!(d_after.last_changed, d_before.last_changed, "listing value-equal → last_changed not advanced");
     assert_eq!(g_after.last_changed, g_before.last_changed, "glob cut off → last_changed unchanged");
@@ -276,7 +276,7 @@ fn removing_a_file_shrinks_glob() {
     assert_eq!(gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()), vec!["src/a.txt".to_string(), "src/b.txt".to_string()]);
 
     fs.remove("/w/src/a.txt"); // a matching file disappears
-    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![dlkey("src")] });
+    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(dlkey("src"))] });
 
     assert_eq!(gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()), vec!["src/b.txt".to_string()], "removing a file shrinks the glob");
 }
@@ -314,12 +314,12 @@ fn editing_bzl_reevaluates() {
     fs.set("/w/rules.bzl", b"x = 1\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&bkey("rules.bzl")).unwrap(); // warm
-    let before = engine.version(&bkey("rules.bzl")).unwrap();
+    let before = engine.inspect(&bkey("rules.bzl")).unwrap();
 
     fs.set("/w/rules.bzl", b"x = 99\n", 2); // genuine source change
-    engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("rules.bzl")] });
+    engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("rules.bzl"))] });
 
-    let after = engine.version(&bkey("rules.bzl")).unwrap();
+    let after = engine.inspect(&bkey("rules.bzl")).unwrap();
     assert!(after.last_changed > before.last_changed, "a .bzl source change re-evaluates BZL_LOAD");
     assert_eq!(bget(&engine.request(&bkey("rules.bzl")).unwrap(), "x"), Some(BzlValue::Int(99)));
 }
@@ -330,12 +330,12 @@ fn touching_bzl_does_not_reevaluate() {
     fs.set("/w/rules.bzl", b"x = 1\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&bkey("rules.bzl")).unwrap(); // warm
-    let before = engine.version(&bkey("rules.bzl")).unwrap();
+    let before = engine.inspect(&bkey("rules.bzl")).unwrap();
 
     fs.set("/w/rules.bzl", b"x = 1\n", 999); // TOUCH: new mtime, identical source bytes
-    engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("rules.bzl")] });
+    engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("rules.bzl"))] });
 
-    let after = engine.version(&bkey("rules.bzl")).unwrap();
+    let after = engine.inspect(&bkey("rules.bzl")).unwrap();
     assert_eq!(after.last_changed, before.last_changed, "a touch (same bytes) must NOT re-parse the .bzl — the FILE content-cutoff propagates");
     assert!(after.last_evaluated > before.last_evaluated, "BZL_LOAD is re-checked this round, just not recomputed");
 }
@@ -357,12 +357,12 @@ fn editing_loaded_bzl_propagates_to_loader() {
     fs.set("/w/pkg/a.bzl", b"load(\":b.bzl\", \"y\")\nx = y + 2\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&bkey("pkg/a.bzl")).unwrap(); // warm: BZL_LOAD(a) now depends on BZL_LOAD(b)
-    let before = engine.version(&bkey("pkg/a.bzl")).unwrap();
+    let before = engine.inspect(&bkey("pkg/a.bzl")).unwrap();
 
     fs.set("/w/pkg/b.bzl", b"y = 100\n", 2); // edit the LOADED .bzl, not the loader
-    engine.evaluate(&[bkey("pkg/a.bzl")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("pkg/b.bzl")] });
+    engine.evaluate(&[bkey("pkg/a.bzl")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("pkg/b.bzl"))] });
 
-    let after = engine.version(&bkey("pkg/a.bzl")).unwrap();
+    let after = engine.inspect(&bkey("pkg/a.bzl")).unwrap();
     assert!(after.last_changed > before.last_changed, "editing a loaded .bzl re-evaluates its loader (transitive through the load graph)");
     assert_eq!(bget(&engine.request(&bkey("pkg/a.bzl")).unwrap(), "x"), Some(BzlValue::Int(102)));
 }
@@ -495,12 +495,12 @@ fn editing_build_reevaluates_package() {
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("p")).unwrap(); // warm
-    let before = engine.version(&pkey("p")).unwrap();
+    let before = engine.inspect(&pkey("p")).unwrap();
 
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\ntarget(kind = \"r\", name = \"b\")\n", 2);
-    engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("p/BUILD.bazel")] });
+    engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("p/BUILD.bazel"))] });
 
-    let after = engine.version(&pkey("p")).unwrap();
+    let after = engine.inspect(&pkey("p")).unwrap();
     assert!(after.last_changed > before.last_changed, "a BUILD edit (new target) re-evaluates the package");
     assert_eq!(pkg(&engine.request(&pkey("p")).unwrap()).targets.len(), 2);
 }
@@ -511,12 +511,12 @@ fn touching_build_does_not_reevaluate_package() {
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("p")).unwrap(); // warm
-    let before = engine.version(&pkey("p")).unwrap();
+    let before = engine.inspect(&pkey("p")).unwrap();
 
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\n", 999); // TOUCH: new mtime, same bytes
-    engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("p/BUILD.bazel")] });
+    engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("p/BUILD.bazel"))] });
 
-    let after = engine.version(&pkey("p")).unwrap();
+    let after = engine.inspect(&pkey("p")).unwrap();
     assert_eq!(after.last_changed, before.last_changed, "a touch (same BUILD bytes) must NOT re-evaluate the package — FILE content-cutoff propagates");
     assert!(after.last_evaluated > before.last_evaluated, "PACKAGE is re-checked this round, just not recomputed");
 }
@@ -546,12 +546,12 @@ fn editing_loaded_bzl_propagates_to_package() {
     fs.set("/w/p/BUILD.bazel", b"load(\":defs.bzl\", \"SRCS\")\ntarget(kind = \"r\", name = \"a\", srcs = SRCS)\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("p")).unwrap(); // warm: PACKAGE(p) now depends on BZL_LOAD(p/defs.bzl)
-    let before = engine.version(&pkey("p")).unwrap();
+    let before = engine.inspect(&pkey("p")).unwrap();
 
     fs.set("/w/p/defs.bzl", b"SRCS = [\"v2.txt\"]\n", 2); // edit the LOADED .bzl, not the BUILD
-    engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("p/defs.bzl")] });
+    engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("p/defs.bzl"))] });
 
-    let after = engine.version(&pkey("p")).unwrap();
+    let after = engine.inspect(&pkey("p")).unwrap();
     assert!(after.last_changed > before.last_changed, "editing a loaded .bzl re-evaluates the package (transitive)");
     assert_eq!(
         pkg(&engine.request(&pkey("p")).unwrap()).get("a").unwrap().attrs,
@@ -621,7 +621,7 @@ fn rule_schema_edit_rechecks_but_cuts_off_package() {
     fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"lib\", value = 7)\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("app")).unwrap(); // warm
-    let before = engine.version(&pkey("app")).unwrap();
+    let before = engine.inspect(&pkey("app")).unwrap();
 
     // Add an unused attr to the rule schema — changes BZL_LOAD's value, but not the instantiated target.
     fs.set(
@@ -629,9 +629,9 @@ fn rule_schema_edit_rechecks_but_cuts_off_package() {
         b"def _impl(ctx):\n    pass\nmy_rule = rule(implementation = _impl, attrs = {\"value\": attr.int(), \"extra\": attr.string()})\n",
         2,
     );
-    engine.evaluate(&[pkey("app")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("app/rules.bzl")] });
+    engine.evaluate(&[pkey("app")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("app/rules.bzl"))] });
 
-    let after = engine.version(&pkey("app")).unwrap();
+    let after = engine.inspect(&pkey("app")).unwrap();
     assert!(after.last_evaluated > before.last_evaluated, "PACKAGE re-evaluates (its loaded .bzl changed)");
     assert_eq!(after.last_changed, before.last_changed, "but the package value is unchanged → early cutoff (schema is analysis's concern, not loading's)");
 }
@@ -676,7 +676,7 @@ fn analysis_propagates_granularly() {
     for r in &roots {
         engine.request(r).unwrap();
     }
-    let v = |n: &str| engine.version(&ctkey("pkg", n)).unwrap();
+    let v = |n: &str| engine.inspect(&ctkey("pkg", n)).unwrap();
     let (bl, bm, br, bo) = (v("leaf"), v("mid"), v("root"), v("other"));
 
     // Edit ONLY mid's value (10 → 20).
@@ -689,7 +689,7 @@ fn analysis_propagates_granularly() {
           my_rule(name = \"other\", value = 1)\n",
         2,
     );
-    engine.evaluate(&roots, FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("pkg/BUILD.bazel")] });
+    engine.evaluate(&roots, FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("pkg/BUILD.bazel"))] });
 
     let (al, am, ar, ao) = (v("leaf"), v("mid"), v("root"), v("other"));
     assert!(am.last_changed > bm.last_changed, "mid's value changed → its providers change");
@@ -712,7 +712,7 @@ fn editing_rule_impl_reevaluates_configured_target() {
     fs.set("/w/pkg/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\", value = 5)\n", 1);
     let engine = build_analysis_engine(fs.clone(), HostPath::new("/w"));
     assert_eq!(ct_total(&engine.request(&ctkey("pkg", "t")).unwrap()), 5);
-    let before = engine.version(&ctkey("pkg", "t")).unwrap();
+    let before = engine.inspect(&ctkey("pkg", "t")).unwrap();
 
     // Same schema (value attr), different impl: total = value + 1000.
     let impl_v2 = b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
@@ -720,9 +720,9 @@ fn editing_rule_impl_reevaluates_configured_target() {
         \x20   return [NumberInfo(total = ctx.attr.value + 1000)]\n\
         my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int()})\n";
     fs.set("/w/pkg/rules.bzl", impl_v2, 2);
-    engine.evaluate(&[ctkey("pkg", "t")], FailurePolicy::FailFast, &Diff { changed_leaves: vec![fskey("pkg/rules.bzl")] });
+    engine.evaluate(&[ctkey("pkg", "t")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("pkg/rules.bzl"))] });
 
-    let after = engine.version(&ctkey("pkg", "t")).unwrap();
+    let after = engine.inspect(&ctkey("pkg", "t")).unwrap();
     assert!(after.last_changed > before.last_changed, "an impl edit re-analyzes (FILE content dep, not just BZL_LOAD schema)");
     assert_eq!(ct_total(&engine.request(&ctkey("pkg", "t")).unwrap()), 1005, "the new impl ran");
 }
@@ -914,7 +914,7 @@ fn rule_declared_action_executes_over_the_engine() {
     assert_eq!(out.digest, Digest::of(&fake_output_content(&req, "out")), "the ACTION output IS the strategy's output");
 
     // incremental: re-evaluating with no relevant change does not re-run the action (content-keyed cutoff).
-    let rep = engine.evaluate(&[akey], FailurePolicy::FailFast, &Diff { changed_leaves: vec![] });
+    let rep = engine.evaluate(&[akey], FailurePolicy::FailFast, Diff { changed: vec![] });
     assert_eq!(rep.recomputes, 0, "an unchanged action is not re-executed");
 }
 
