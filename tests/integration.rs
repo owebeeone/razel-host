@@ -7,9 +7,12 @@ use razel_core::{Digest, NodeKey, NodeValue};
 use razel_engine_api::{ChangedLeaf, DemandEngine, Diff, FailurePolicy};
 use razel_bzl_api::{BzlValue, ProviderId, ProviderInstance, RuleOrigin};
 use razel_host::build_analysis_engine_with_toolchains;
-use razel_toolchain::{Constraint, Platform, RegisteredToolchain, ToolchainType};
+use razel_toolchain::{
+    Constraint, Platform, RegisteredExecPlatform, RegisteredExecutionPlatformsKey, RegisteredToolchain,
+    RegisteredToolchainsKey, ToolchainContextKey, ToolchainType, ToolchainTypeReq,
+};
 use razel_host::{build_analysis_engine, build_loading_engine, build_source_engine};
-use razel_ids::RootRelativePath;
+use razel_ids::{ConfigId, RootRelativePath};
 use razel_load::{BzlLoadKey, BzlModuleValue};
 use razel_package::{Package, PackageKey};
 use razel_analysis::{ConfiguredTarget, ConfiguredTargetKey};
@@ -166,12 +169,12 @@ fn content_change_propagates() {
     fs.set("/w/a.txt", b"v1", 100);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&fkey("a.txt")).unwrap(); // warm
-    let before = engine.inspect(&fkey("a.txt")).unwrap();
+    let before = engine.inspect(&fkey("a.txt")).unwrap().version;
 
     fs.set("/w/a.txt", b"v2-different", 200); // genuine content change (mtime too)
     engine.evaluate(&[fkey("a.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("a.txt"))] });
 
-    let after = engine.inspect(&fkey("a.txt")).unwrap();
+    let after = engine.inspect(&fkey("a.txt")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "content changed → FILE propagates");
     assert_eq!(fval(&engine.request(&fkey("a.txt")).unwrap()).content, Digest::of(b"v2-different"));
 }
@@ -182,14 +185,14 @@ fn touch_without_content_change_is_cut_off() {
     fs.set("/w/a.txt", b"same", 100);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&fkey("a.txt")).unwrap(); // warm
-    let bf = engine.inspect(&fkey("a.txt")).unwrap();
-    let bs = engine.inspect(&fskey("a.txt")).unwrap();
+    let bf = engine.inspect(&fkey("a.txt")).unwrap().version;
+    let bs = engine.inspect(&fskey("a.txt")).unwrap().version;
 
     fs.set("/w/a.txt", b"same", 999); // TOUCH: new mtime, identical content
     engine.evaluate(&[fkey("a.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("a.txt"))] });
 
-    let af = engine.inspect(&fkey("a.txt")).unwrap();
-    let as_ = engine.inspect(&fskey("a.txt")).unwrap();
+    let af = engine.inspect(&fkey("a.txt")).unwrap().version;
+    let as_ = engine.inspect(&fskey("a.txt")).unwrap().version;
     assert!(as_.last_changed > bs.last_changed, "stat (mtime) changed → FILE_STATE advances");
     assert_eq!(af.last_changed, bf.last_changed, "content identical → FILE early-cutoff (no propagation)");
     assert!(af.last_evaluated > bf.last_evaluated, "but FILE was re-evaluated (re-read) this round");
@@ -216,12 +219,12 @@ fn adding_a_file_reexpands_glob() {
     fs.set("/w/src/b.txt", b"b", 1);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&gkey("src", "*.txt")).unwrap(); // warm
-    let before = engine.inspect(&gkey("src", "*.txt")).unwrap();
+    let before = engine.inspect(&gkey("src", "*.txt")).unwrap().version;
 
     fs.set("/w/src/d.txt", b"d", 1); // a new matching file appears in the directory
     engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(dlkey("src"))] });
 
-    let after = engine.inspect(&gkey("src", "*.txt")).unwrap();
+    let after = engine.inspect(&gkey("src", "*.txt")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "a new matching file re-expands the glob");
     assert_eq!(
         gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()),
@@ -252,16 +255,16 @@ fn over_broad_listing_invalidation_still_cuts_off_glob() {
     fs.set("/w/src/b.txt", b"b", 1);
     let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&gkey("src", "*.txt")).unwrap(); // warm
-    let g_before = engine.inspect(&gkey("src", "*.txt")).unwrap();
-    let d_before = engine.inspect(&dlkey("src")).unwrap();
+    let g_before = engine.inspect(&gkey("src", "*.txt")).unwrap().version;
+    let d_before = engine.inspect(&dlkey("src")).unwrap().version;
 
     // An over-broad monitor re-dirties the whole DIRECTORY_LISTING on a mere mtime change, but the entry
     // (name, is_dir) set is identical → the listing value is unchanged → the glob is pruned by cutoff.
     fs.set("/w/src/a.txt", b"a", 999);
     let rep = engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(dlkey("src"))] });
 
-    let g_after = engine.inspect(&gkey("src", "*.txt")).unwrap();
-    let d_after = engine.inspect(&dlkey("src")).unwrap();
+    let g_after = engine.inspect(&gkey("src", "*.txt")).unwrap().version;
+    let d_after = engine.inspect(&dlkey("src")).unwrap().version;
     assert_eq!(rep.recomputes, 1, "only DIRECTORY_LISTING recomputes; the glob is pruned");
     assert_eq!(d_after.last_changed, d_before.last_changed, "listing value-equal → last_changed not advanced");
     assert_eq!(g_after.last_changed, g_before.last_changed, "glob cut off → last_changed unchanged");
@@ -314,12 +317,12 @@ fn editing_bzl_reevaluates() {
     fs.set("/w/rules.bzl", b"x = 1\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&bkey("rules.bzl")).unwrap(); // warm
-    let before = engine.inspect(&bkey("rules.bzl")).unwrap();
+    let before = engine.inspect(&bkey("rules.bzl")).unwrap().version;
 
     fs.set("/w/rules.bzl", b"x = 99\n", 2); // genuine source change
     engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("rules.bzl"))] });
 
-    let after = engine.inspect(&bkey("rules.bzl")).unwrap();
+    let after = engine.inspect(&bkey("rules.bzl")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "a .bzl source change re-evaluates BZL_LOAD");
     assert_eq!(bget(&engine.request(&bkey("rules.bzl")).unwrap(), "x"), Some(BzlValue::Int(99)));
 }
@@ -330,12 +333,12 @@ fn touching_bzl_does_not_reevaluate() {
     fs.set("/w/rules.bzl", b"x = 1\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&bkey("rules.bzl")).unwrap(); // warm
-    let before = engine.inspect(&bkey("rules.bzl")).unwrap();
+    let before = engine.inspect(&bkey("rules.bzl")).unwrap().version;
 
     fs.set("/w/rules.bzl", b"x = 1\n", 999); // TOUCH: new mtime, identical source bytes
     engine.evaluate(&[bkey("rules.bzl")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("rules.bzl"))] });
 
-    let after = engine.inspect(&bkey("rules.bzl")).unwrap();
+    let after = engine.inspect(&bkey("rules.bzl")).unwrap().version;
     assert_eq!(after.last_changed, before.last_changed, "a touch (same bytes) must NOT re-parse the .bzl — the FILE content-cutoff propagates");
     assert!(after.last_evaluated > before.last_evaluated, "BZL_LOAD is re-checked this round, just not recomputed");
 }
@@ -357,12 +360,12 @@ fn editing_loaded_bzl_propagates_to_loader() {
     fs.set("/w/pkg/a.bzl", b"load(\":b.bzl\", \"y\")\nx = y + 2\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&bkey("pkg/a.bzl")).unwrap(); // warm: BZL_LOAD(a) now depends on BZL_LOAD(b)
-    let before = engine.inspect(&bkey("pkg/a.bzl")).unwrap();
+    let before = engine.inspect(&bkey("pkg/a.bzl")).unwrap().version;
 
     fs.set("/w/pkg/b.bzl", b"y = 100\n", 2); // edit the LOADED .bzl, not the loader
     engine.evaluate(&[bkey("pkg/a.bzl")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("pkg/b.bzl"))] });
 
-    let after = engine.inspect(&bkey("pkg/a.bzl")).unwrap();
+    let after = engine.inspect(&bkey("pkg/a.bzl")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "editing a loaded .bzl re-evaluates its loader (transitive through the load graph)");
     assert_eq!(bget(&engine.request(&bkey("pkg/a.bzl")).unwrap(), "x"), Some(BzlValue::Int(102)));
 }
@@ -495,12 +498,12 @@ fn editing_build_reevaluates_package() {
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("p")).unwrap(); // warm
-    let before = engine.inspect(&pkey("p")).unwrap();
+    let before = engine.inspect(&pkey("p")).unwrap().version;
 
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\ntarget(kind = \"r\", name = \"b\")\n", 2);
     engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("p/BUILD.bazel"))] });
 
-    let after = engine.inspect(&pkey("p")).unwrap();
+    let after = engine.inspect(&pkey("p")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "a BUILD edit (new target) re-evaluates the package");
     assert_eq!(pkg(&engine.request(&pkey("p")).unwrap()).targets.len(), 2);
 }
@@ -511,12 +514,12 @@ fn touching_build_does_not_reevaluate_package() {
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("p")).unwrap(); // warm
-    let before = engine.inspect(&pkey("p")).unwrap();
+    let before = engine.inspect(&pkey("p")).unwrap().version;
 
     fs.set("/w/p/BUILD.bazel", b"target(kind = \"r\", name = \"a\")\n", 999); // TOUCH: new mtime, same bytes
     engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("p/BUILD.bazel"))] });
 
-    let after = engine.inspect(&pkey("p")).unwrap();
+    let after = engine.inspect(&pkey("p")).unwrap().version;
     assert_eq!(after.last_changed, before.last_changed, "a touch (same BUILD bytes) must NOT re-evaluate the package — FILE content-cutoff propagates");
     assert!(after.last_evaluated > before.last_evaluated, "PACKAGE is re-checked this round, just not recomputed");
 }
@@ -546,12 +549,12 @@ fn editing_loaded_bzl_propagates_to_package() {
     fs.set("/w/p/BUILD.bazel", b"load(\":defs.bzl\", \"SRCS\")\ntarget(kind = \"r\", name = \"a\", srcs = SRCS)\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("p")).unwrap(); // warm: PACKAGE(p) now depends on BZL_LOAD(p/defs.bzl)
-    let before = engine.inspect(&pkey("p")).unwrap();
+    let before = engine.inspect(&pkey("p")).unwrap().version;
 
     fs.set("/w/p/defs.bzl", b"SRCS = [\"v2.txt\"]\n", 2); // edit the LOADED .bzl, not the BUILD
     engine.evaluate(&[pkey("p")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("p/defs.bzl"))] });
 
-    let after = engine.inspect(&pkey("p")).unwrap();
+    let after = engine.inspect(&pkey("p")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "editing a loaded .bzl re-evaluates the package (transitive)");
     assert_eq!(
         pkg(&engine.request(&pkey("p")).unwrap()).get("a").unwrap().attrs,
@@ -621,7 +624,7 @@ fn rule_schema_edit_rechecks_but_cuts_off_package() {
     fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"lib\", value = 7)\n", 1);
     let engine = build_loading_engine(fs.clone(), HostPath::new("/w"));
     engine.request(&pkey("app")).unwrap(); // warm
-    let before = engine.inspect(&pkey("app")).unwrap();
+    let before = engine.inspect(&pkey("app")).unwrap().version;
 
     // Add an unused attr to the rule schema — changes BZL_LOAD's value, but not the instantiated target.
     fs.set(
@@ -631,7 +634,7 @@ fn rule_schema_edit_rechecks_but_cuts_off_package() {
     );
     engine.evaluate(&[pkey("app")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("app/rules.bzl"))] });
 
-    let after = engine.inspect(&pkey("app")).unwrap();
+    let after = engine.inspect(&pkey("app")).unwrap().version;
     assert!(after.last_evaluated > before.last_evaluated, "PACKAGE re-evaluates (its loaded .bzl changed)");
     assert_eq!(after.last_changed, before.last_changed, "but the package value is unchanged → early cutoff (schema is analysis's concern, not loading's)");
 }
@@ -676,7 +679,7 @@ fn analysis_propagates_granularly() {
     for r in &roots {
         engine.request(r).unwrap();
     }
-    let v = |n: &str| engine.inspect(&ctkey("pkg", n)).unwrap();
+    let v = |n: &str| engine.inspect(&ctkey("pkg", n)).unwrap().version;
     let (bl, bm, br, bo) = (v("leaf"), v("mid"), v("root"), v("other"));
 
     // Edit ONLY mid's value (10 → 20).
@@ -712,7 +715,7 @@ fn editing_rule_impl_reevaluates_configured_target() {
     fs.set("/w/pkg/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\", value = 5)\n", 1);
     let engine = build_analysis_engine(fs.clone(), HostPath::new("/w"));
     assert_eq!(ct_total(&engine.request(&ctkey("pkg", "t")).unwrap()), 5);
-    let before = engine.inspect(&ctkey("pkg", "t")).unwrap();
+    let before = engine.inspect(&ctkey("pkg", "t")).unwrap().version;
 
     // Same schema (value attr), different impl: total = value + 1000.
     let impl_v2 = b"NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])\n\
@@ -722,7 +725,7 @@ fn editing_rule_impl_reevaluates_configured_target() {
     fs.set("/w/pkg/rules.bzl", impl_v2, 2);
     engine.evaluate(&[ctkey("pkg", "t")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("pkg/rules.bzl"))] });
 
-    let after = engine.inspect(&ctkey("pkg", "t")).unwrap();
+    let after = engine.inspect(&ctkey("pkg", "t")).unwrap().version;
     assert!(after.last_changed > before.last_changed, "an impl edit re-analyzes (FILE content dep, not just BZL_LOAD schema)");
     assert_eq!(ct_total(&engine.request(&ctkey("pkg", "t")).unwrap()), 1005, "the new impl ran");
 }
@@ -796,6 +799,7 @@ fn cc_toolchain(os: &str, value: i64) -> RegisteredToolchain {
     RegisteredToolchain {
         toolchain_type: ToolchainType("//cc:toolchain_type".into()),
         target_compatible_with: vec![Constraint(format!("os:{os}"))],
+        exec_compatible_with: vec![],
         info: ProviderInstance {
             provider: ProviderId("CcInfo".into()),
             fields: vec![("value".to_string(), BzlValue::Int(value))],
@@ -808,46 +812,67 @@ fn two_platforms() -> HashMap<String, Platform> {
     m.insert("p_macos".to_string(), Platform { constraints: vec![Constraint("os:macos".into())] });
     m
 }
+fn host_ep() -> RegisteredExecPlatform {
+    RegisteredExecPlatform { name: "host".to_string(), constraints: vec![] }
+}
+fn reg_tc_key(cfg: &str) -> NodeKey {
+    NodeKey::from_key(&RegisteredToolchainsKey { configuration: ConfigId(cfg.into()) })
+}
+fn reg_ep_key(cfg: &str) -> NodeKey {
+    NodeKey::from_key(&RegisteredExecutionPlatformsKey { configuration: ConfigId(cfg.into()) })
+}
+/// The SAME canonical key analysis builds for a rule's required type-set (all mandatory in v1).
+fn tc_ctx_key(cfg: &str, types: &[&str]) -> NodeKey {
+    NodeKey::from_key(&ToolchainContextKey::new(
+        ConfigId(cfg.into()),
+        types
+            .iter()
+            .map(|t| ToolchainTypeReq { toolchain_type: ToolchainType(t.to_string()), mandatory: true })
+            .collect(),
+        vec![],
+        None,
+        false,
+    ))
+}
 
 #[test]
 fn toolchain_resolves_by_platform_g4_exam() {
     // THE G4 exam over the engine: a rule requires a toolchain type; two toolchains are registered (linux/macos)
     // differing only by their target constraint; the resolved ctx.toolchains[type] — hence the rule's output —
-    // FLIPS with the target platform (the CONFIGURATION key). Data-driven selection, NO host fixture.
+    // FLIPS with the CONFIGURATION (from which the target platform is DERIVED). Data-driven, NO host fixture.
     let fs = Arc::new(MutFs::new());
     fs.set("/w/app/rules.bzl", TC_RULES, 1);
     fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
-    let engine = build_analysis_engine_with_toolchains(
-        fs,
-        HostPath::new("/w"),
-        vec![cc_toolchain("linux", 1), cc_toolchain("macos", 2)],
-        two_platforms(),
-    );
-    assert_eq!(ct_total(&engine.request(&ctkey_cfg("app", "t", "p_linux")).unwrap()), 1, "linux platform → linux cc (value 1)");
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), two_platforms(), host_ep());
+    for cfg in ["p_linux", "p_macos"] {
+        registry.set_toolchains(&ConfigId(cfg.into()), vec![cc_toolchain("linux", 1), cc_toolchain("macos", 2)]);
+    }
+    assert_eq!(ct_total(&engine.request(&ctkey_cfg("app", "t", "p_linux")).unwrap()), 1, "linux config → linux cc (value 1)");
     assert_eq!(
         ct_total(&engine.request(&ctkey_cfg("app", "t", "p_macos")).unwrap()),
         2,
-        "flip the target platform → the resolved toolchain flips (value 2) — data-driven, no fixture"
+        "flip the configuration → the derived platform + resolved toolchain flip (value 2) — data-driven, no fixture"
     );
 }
 
 #[test]
 fn toolchain_requiring_target_without_configuration_is_fail_closed() {
     // A toolchain-requiring target whose configuration is None must FAIL CLOSED — even when a "" (empty-name)
-    // platform IS registered. The bug this guards: coercing a missing configuration to the empty platform name
-    // (`unwrap_or_default()`) so the target silently resolves against whatever "" platform exists (an Absorb —
-    // a missing key dimension becoming a default value). Here a "" platform with a compatible cc toolchain is
-    // registered on purpose; correct behavior is still an error, because the target itself has no configuration.
+    // configuration IS fully registered. The bug this guards: coercing a missing configuration to the empty
+    // ConfigId so the target silently resolves against whatever "" registration exists (an Absorb — a missing
+    // key dimension becoming a default value). Here the "" config has a platform AND a compatible cc toolchain
+    // on purpose; correct behavior is still an error, because the target itself has no configuration.
     let fs = Arc::new(MutFs::new());
     fs.set("/w/app/rules.bzl", TC_RULES, 1);
     fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
     let mut platforms = HashMap::new();
     platforms.insert("".to_string(), Platform { constraints: vec![Constraint("os:linux".into())] });
-    let engine = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), vec![cc_toolchain("linux", 1)], platforms);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), platforms, host_ep());
+    registry.set_toolchains(&ConfigId("".into()), vec![cc_toolchain("linux", 1)]);
     // `ctkey` (not `ctkey_cfg`) → configuration is None.
     assert!(
         engine.request(&ctkey("app", "t")).is_err(),
-        "a toolchain-requiring target with no configuration must fail closed, not resolve against a default \"\" platform"
+        "a toolchain-requiring target with no configuration must fail closed, not resolve against a default \"\" config"
     );
 }
 
@@ -860,10 +885,147 @@ fn rule_requiring_unavailable_toolchain_is_fail_closed() {
     fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
     let mut platforms = HashMap::new();
     platforms.insert("p_windows".to_string(), Platform { constraints: vec![Constraint("os:windows".into())] });
-    let engine = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), vec![cc_toolchain("linux", 1)], platforms);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), platforms, host_ep());
+    registry.set_toolchains(&ConfigId("p_windows".into()), vec![cc_toolchain("linux", 1)]);
     assert!(
         engine.request(&ctkey_cfg("app", "t", "p_windows")).is_err(),
         "no cc toolchain compatible with the platform → the configured target fails closed"
+    );
+}
+
+#[test]
+fn registered_toolchain_set_change_reresolves() {
+    // THE HEADLINE lockdown gate (`toolchain_context_key_registered_toolchain_set_change`, decision A): the
+    // registered set is a config-keyed DEPENDENCY node, so a `register_toolchains()` change — applied to the
+    // SHARED registry under the RUNNING engine and dirtied via the engine Diff — re-resolves the context and
+    // re-analyzes the configured target. `mutant_toolchain_registered_set_not_a_dep` (the spike's leaf shape)
+    // bakes the set outside the edge: the change then invalidates NOTHING and this test goes RED on stale data.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), two_platforms(), host_ep());
+    let cfg = ConfigId("p_linux".into());
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1)]);
+    let ct = ctkey_cfg("app", "t", "p_linux");
+    assert_eq!(ct_total(&engine.request(&ct).unwrap()), 1, "warm: the registered cc resolves (value 1)");
+    let before = engine.inspect(&ct).unwrap().version;
+
+    // the registration CHANGES (same type, different toolchain_info) → dirty the registry node.
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 7)]);
+    engine.evaluate(&[ct.clone()], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(reg_tc_key("p_linux"))] });
+
+    let after = engine.inspect(&ct).unwrap().version;
+    assert!(after.last_changed > before.last_changed, "a registered-set change must re-resolve + re-analyze");
+    assert_eq!(ct_total(&engine.request(&ct).unwrap()), 7, "the NEW registration is served, never the stale context");
+}
+
+#[test]
+fn equal_registered_set_early_cuts() {
+    // Decision A's other half: re-registering an EQUAL set recomputes only the registry node — the
+    // comparable value early-cuts, so neither the toolchain context nor the configured target recomputes.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), two_platforms(), host_ep());
+    let cfg = ConfigId("p_linux".into());
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1)]);
+    let ct = ctkey_cfg("app", "t", "p_linux");
+    engine.request(&ct).unwrap(); // warm
+    let tc = tc_ctx_key("p_linux", &["//cc:toolchain_type"]);
+    let (tc_before, ct_before) = (engine.inspect(&tc).unwrap().version, engine.inspect(&ct).unwrap().version);
+
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1)]); // the SAME set again
+    let rep = engine.evaluate(&[ct.clone()], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(reg_tc_key("p_linux"))] });
+
+    assert_eq!(rep.recomputes, 1, "only REGISTERED_TOOLCHAINS recomputes; the equal set prunes everything above");
+    assert_eq!(engine.inspect(&tc).unwrap().version.last_changed, tc_before.last_changed, "context cut off (equal set)");
+    assert_eq!(engine.inspect(&ct).unwrap().version.last_changed, ct_before.last_changed, "configured target cut off");
+}
+
+#[test]
+fn changed_set_with_equal_resolved_context_cuts_off() {
+    // The lockdown §2 invalidation story, spelled out: the registered set CHANGES (an unrelated type is
+    // added) → the edge dirties the context and it RE-RESOLVES — but the resolved context is value-equal,
+    // so change-pruning stops there and the configured target is never re-analyzed.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), two_platforms(), host_ep());
+    let cfg = ConfigId("p_linux".into());
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1)]);
+    let ct = ctkey_cfg("app", "t", "p_linux");
+    engine.request(&ct).unwrap(); // warm
+    let tc = tc_ctx_key("p_linux", &["//cc:toolchain_type"]);
+    let (tc_before, ct_before) = (engine.inspect(&tc).unwrap().version, engine.inspect(&ct).unwrap().version);
+
+    // ADD a toolchain of a type this rule never requested — the SET differs, the RESOLVED context doesn't.
+    let unrelated = RegisteredToolchain {
+        toolchain_type: ToolchainType("//zig:toolchain_type".into()),
+        target_compatible_with: vec![],
+        exec_compatible_with: vec![],
+        info: ProviderInstance { provider: ProviderId("ZigInfo".into()), fields: vec![] },
+    };
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1), unrelated]);
+    let rep = engine.evaluate(&[ct.clone()], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(reg_tc_key("p_linux"))] });
+
+    assert_eq!(rep.recomputes, 2, "the registry node AND the context re-resolve; the equal context prunes the CT");
+    let tc_after = engine.inspect(&tc).unwrap().version;
+    assert_eq!(tc_after.last_changed, tc_before.last_changed, "the re-resolved context is value-equal → cut off");
+    assert!(tc_after.last_evaluated > tc_before.last_evaluated, "but the context WAS re-resolved this round");
+    assert_eq!(engine.inspect(&ct).unwrap().version.last_changed, ct_before.last_changed, "the configured target never re-analyzed");
+}
+
+#[test]
+fn exec_platform_registration_change_reresolves() {
+    // REGISTERED_EXECUTION_PLATFORMS is its own config-keyed dependency node (Bazel-faithful): changing the
+    // registered exec-platform set re-selects the context's execution platform through the SAME edge pattern.
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), two_platforms(), host_ep());
+    let cfg = ConfigId("p_linux".into());
+    registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1)]);
+    registry.set_exec_platforms(&cfg, vec![RegisteredExecPlatform { name: "ep_a".into(), constraints: vec![] }]);
+    let ct = ctkey_cfg("app", "t", "p_linux");
+    assert_eq!(ct_total(&engine.request(&ct).unwrap()), 1);
+    let tc = tc_ctx_key("p_linux", &["//cc:toolchain_type"]);
+    let (tc_before, ct_before) = (engine.inspect(&tc).unwrap().version, engine.inspect(&ct).unwrap().version);
+
+    // swap the registered exec platform → the selected platform changes → the context VALUE changes...
+    registry.set_exec_platforms(&cfg, vec![RegisteredExecPlatform { name: "ep_b".into(), constraints: vec![] }]);
+    engine.evaluate(&[ct.clone()], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(reg_ep_key("p_linux"))] });
+
+    assert!(engine.inspect(&tc).unwrap().version.last_changed > tc_before.last_changed, "the re-selected context propagates");
+    // ...but the rule's OUTPUT (providers from the same toolchain_info) is unchanged → the CT cuts off.
+    assert_eq!(engine.inspect(&ct).unwrap().version.last_changed, ct_before.last_changed, "same providers → CT early-cutoff");
+    assert_eq!(ct_total(&engine.request(&ct).unwrap()), 1);
+}
+
+#[test]
+fn exec_selection_supplies_all_mandatory_over_the_root() {
+    // Decision F over the composition root: the FIRST registered exec platform cannot supply the mandatory
+    // type (the cc toolchain is exec-compatible only with the capable one) → selection must skip it and the
+    // rule still resolves. `mutant_toolchain_exec_selection_first_candidate` picks the first candidate
+    // regardless → the mandatory type is unsupplied → this test goes RED (fail-closed error).
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/app/rules.bzl", TC_RULES, 1);
+    fs.set("/w/app/BUILD.bazel", b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"t\")\n", 1);
+    let (engine, registry) = build_analysis_engine_with_toolchains(fs, HostPath::new("/w"), two_platforms(), host_ep());
+    let cfg = ConfigId("p_linux".into());
+    let mut tc = cc_toolchain("linux", 3);
+    tc.exec_compatible_with = vec![Constraint("exec:cap".into())];
+    registry.set_toolchains(&cfg, vec![tc]);
+    registry.set_exec_platforms(
+        &cfg,
+        vec![
+            RegisteredExecPlatform { name: "ep_plain".into(), constraints: vec![] },
+            RegisteredExecPlatform { name: "ep_cap".into(), constraints: vec![Constraint("exec:cap".into())] },
+        ],
+    );
+    assert_eq!(
+        ct_total(&engine.request(&ctkey_cfg("app", "t", "p_linux")).unwrap()),
+        3,
+        "the exec platform supplying ALL mandatory types is selected (not the first candidate)"
     );
 }
 

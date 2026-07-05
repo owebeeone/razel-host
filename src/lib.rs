@@ -8,7 +8,7 @@ use razel_bzl_starlark::StarlarkEvaluator;
 use razel_engine::Engine;
 use razel_exec_api::SpawnStrategy;
 use razel_os_api::{HostPath, System};
-use razel_toolchain::{Platform, RegisteredToolchain};
+use razel_toolchain::{Platform, RegisteredExecPlatform, ToolchainRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,28 +34,42 @@ pub fn build_loading_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
 
 /// Build an `Engine` spanning loading AND analysis: source → `.bzl` → packages → `CONFIGURED_TARGET`. A target's
 /// rule implementation runs over the engine, with providers propagating granularly across the dependency graph.
-/// No toolchains registered — a rule requiring one resolves fail-closed (use `build_analysis_engine_with_toolchains`).
+/// No registrations seeded and no platform definitions — a rule requiring a toolchain resolves fail-closed
+/// (use `build_analysis_engine_with_toolchains` and seed the returned registry).
 pub fn build_analysis_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
-    build_analysis_engine_with_toolchains(sys, root, Vec::new(), HashMap::new())
+    build_analysis_engine_with_toolchains(
+        sys,
+        root,
+        HashMap::new(),
+        RegisteredExecPlatform { name: "host".to_string(), constraints: Vec::new() },
+    )
+    .0
 }
 
-/// Build an analysis engine AND register `TOOLCHAIN_CONTEXT` with the given registered toolchains + platforms.
-/// A rule's `toolchains=[type]` resolves against this set, keyed by the target platform (the CONFIGURATION
-/// dimension). SPIKE: the registry is supplied here; `.bzl` `toolchain()`/`platform()` declarations are deferred.
+/// Build an analysis engine AND register the toolchain node-kinds: `TOOLCHAIN_CONTEXT` plus the two
+/// config-keyed registration nodes (`REGISTERED_TOOLCHAINS` / `REGISTERED_EXECUTION_PLATFORMS` — the
+/// ADR-0010 lockdown's dependency edges). The registered sets are HOST-INJECTED in v1: they live in the
+/// returned shared [`ToolchainRegistry`] handle, which the caller seeds (keyed by configuration) and may
+/// MUTATE against the running engine — dirty the matching `RegisteredToolchainsKey`/
+/// `RegisteredExecutionPlatformsKey` via `evaluate(.., Diff)` and invalidation flows through the edge.
+/// `platforms` are the platform DEFINITIONS (name → constraints); `host_platform` is always appended as the
+/// final execution-platform candidate. SPIKE: `.bzl` `toolchain()`/`platform()` producers are deferred and
+/// will fill the same nodes behind the same edges.
 pub fn build_analysis_engine_with_toolchains(
     sys: Arc<dyn System>,
     root: HostPath,
-    registered: Vec<RegisteredToolchain>,
     platforms: HashMap<String, Platform>,
-) -> Engine {
+    host_platform: RegisteredExecPlatform,
+) -> (Engine, Arc<ToolchainRegistry>) {
     let mut engine = Engine::new();
     razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone());
     let eval: Arc<dyn BzlEvaluator> = Arc::new(StarlarkEvaluator::new());
     razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
     razel_package::register_package_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
     razel_analysis::register_analysis_kinds(&mut engine, sys, root, eval);
-    razel_toolchain::register_toolchain_kinds(&mut engine, registered, platforms);
-    engine
+    let registry = Arc::new(ToolchainRegistry::new());
+    razel_toolchain::register_toolchain_kinds(&mut engine, registry.clone(), platforms, host_platform);
+    (engine, registry)
 }
 
 /// Build an `Engine` registering loading, analysis AND the execution node-kind: source → `.bzl` →
