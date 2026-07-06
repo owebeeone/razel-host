@@ -254,6 +254,33 @@ fn content_change_does_not_disturb_glob() {
 }
 
 #[test]
+fn add_nonmatching_file_early_cuts_at_glob() {
+    // REQ-SOURCE-002 over the root: adding a NON-matching file changes the DIRECTORY_LISTING value (new
+    // entry), so the glob re-runs — but the GlobMatch is unchanged, so early cutoff stops propagation AT
+    // the glob (its last_changed does not advance).
+    let fs = Arc::new(MutFs::new());
+    fs.set("/w/src/a.txt", b"a", 1);
+    fs.set("/w/src/b.txt", b"b", 1);
+    let engine = build_source_engine(fs.clone(), HostPath::new("/w"));
+    engine.request(&gkey("src", "*.txt")).unwrap(); // warm
+    let g_before = engine.inspect(&gkey("src", "*.txt")).unwrap().version;
+    let d_before = engine.inspect(&dlkey("src")).unwrap().version;
+
+    fs.set("/w/src/c.rs", b"c", 2); // a new NON-matching file appears
+    engine.evaluate(&[gkey("src", "*.txt")], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(dlkey("src"))] });
+
+    let g_after = engine.inspect(&gkey("src", "*.txt")).unwrap().version;
+    let d_after = engine.inspect(&dlkey("src")).unwrap().version;
+    assert!(d_after.last_changed > d_before.last_changed, "the listing's entry set changed → it propagates");
+    assert!(g_after.last_evaluated > g_before.last_evaluated, "the glob re-runs (its listing changed)");
+    assert_eq!(g_after.last_changed, g_before.last_changed, "but the match set is unchanged → early cutoff AT the glob");
+    assert_eq!(
+        gmatch(&engine.request(&gkey("src", "*.txt")).unwrap()),
+        vec!["src/a.txt".to_string(), "src/b.txt".to_string()]
+    );
+}
+
+#[test]
 fn over_broad_listing_invalidation_still_cuts_off_glob() {
     let fs = Arc::new(MutFs::new());
     fs.set("/w/src/a.txt", b"a", 1);
