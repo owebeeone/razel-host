@@ -97,7 +97,12 @@ fn dlkey(p: &str) -> NodeKey { NodeKey::from_key(&DirListingKey(RootRelativePath
 fn gkey(dir: &str, pat: &str) -> NodeKey { NodeKey::from_key(&GlobKey { dir: RootRelativePath(dir.into()), pattern: pat.into() }) }
 fn fval(v: &NodeValue) -> FileValue { v.as_any().downcast_ref::<FileValue>().unwrap().clone() }
 fn gmatch(v: &NodeValue) -> Vec<String> { v.as_any().downcast_ref::<GlobMatch>().unwrap().0.clone() }
-fn bkey(p: &str) -> NodeKey { NodeKey::from_key(&BzlLoadKey(RootRelativePath(p.into()))) }
+fn bkey(p: &str) -> NodeKey {
+    // The six-dimension contract key at its v1 shape (Build{is_prelude:false}, the v1 semantics row, the
+    // evaluator-served env id) — the SAME key the loading/analysis nodes construct, so tests share nodes.
+    let eval = razel_bzl_starlark::StarlarkEvaluator::new();
+    NodeKey::from_key(&BzlLoadKey::v1(RootRelativePath(p.into()), &eval).expect("v1 BZL_LOAD key"))
+}
 fn bget(v: &NodeValue, name: &str) -> Option<BzlValue> {
     v.as_any().downcast_ref::<BzlModuleValue>().unwrap().0.get(name).cloned()
 }
@@ -123,7 +128,7 @@ fn ctkey_cfg(pkg: &str, name: &str, cfg: &str) -> NodeKey {
 }
 fn ct_total(v: &NodeValue) -> i64 {
     let ct = v.as_any().downcast_ref::<ConfiguredTarget>().unwrap();
-    match ct.provider("NumberInfo").and_then(|p| p.get("total")) {
+    match ct.provider(&ProviderId::from_name("NumberInfo")).and_then(|p| p.get("total")) {
         Some(BzlValue::Int(i)) => *i,
         other => panic!("expected NumberInfo.total: int, got {other:?}"),
     }
@@ -801,7 +806,7 @@ fn cc_toolchain(os: &str, value: i64) -> RegisteredToolchain {
         target_compatible_with: vec![Constraint(format!("os:{os}"))],
         exec_compatible_with: vec![],
         info: ProviderInstance {
-            provider: ProviderId("CcInfo".into()),
+            provider: ProviderId::from_name("CcInfo"),
             fields: vec![("value".to_string(), BzlValue::Int(value))],
         },
     }
@@ -963,7 +968,7 @@ fn changed_set_with_equal_resolved_context_cuts_off() {
         toolchain_type: ToolchainType("//zig:toolchain_type".into()),
         target_compatible_with: vec![],
         exec_compatible_with: vec![],
-        info: ProviderInstance { provider: ProviderId("ZigInfo".into()), fields: vec![] },
+        info: ProviderInstance { provider: ProviderId::from_name("ZigInfo"), fields: vec![] },
     };
     registry.set_toolchains(&cfg, vec![cc_toolchain("linux", 1), unrelated]);
     let rep = engine.evaluate(&[ct.clone()], FailurePolicy::FailFast, Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(reg_tc_key("p_linux"))] });
