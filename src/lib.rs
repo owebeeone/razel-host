@@ -72,15 +72,36 @@ pub fn build_analysis_engine_with_toolchains(
     (engine, registry)
 }
 
-/// Build an `Engine` registering loading, analysis AND the execution node-kind: source → `.bzl` →
-/// `CONFIGURED_TARGET`, plus `ACTION` over the supplied `SpawnStrategy` (local/sandbox/remote behind the one seam
-/// — a host decision, no consumer rewrite). NOTE: there is no automatic `CONFIGURED_TARGET → ACTION` demand edge
-/// yet — a rule's declared actions ride on the configured target as templates (`RuleResult.actions`), and the
-/// caller turns each into an `ACTION` node via `razel_action::action_key_from_template`. Wiring that edge (and
-/// resolving input PATHS → producer-output digests) is the deferred artifact-materializer step. Toolchains are
-/// wired as in `build_analysis_engine`.
+/// Build an `Engine` registering loading, analysis AND the execution node-kinds of the artifact-model
+/// lockdown: source → `.bzl` → `CONFIGURED_TARGET`, plus `ACTION` (positional `GeneratingActionKey`) +
+/// `ARTIFACT` + `TARGET_COMPLETION` over the supplied `SpawnStrategy` (local/sandbox/remote behind the one
+/// seam — a host decision, no consumer rewrite). Execution is ON the demand graph: requesting
+/// `TARGET_COMPLETION{ct, Default}` (or an output's `ARTIFACT`) builds the target's outputs as a pure graph
+/// consequence — CT → ARTIFACT → ACTION → spawn → digests — with no hand bridge. v1 injections: the
+/// `SameTargetOrSourceResolver` input policy + an in-memory `BlobStore` (use
+/// [`build_execution_engine_with`] to inject custom seam impls and keep a handle on the store). Toolchains
+/// are wired as in `build_analysis_engine`.
 pub fn build_execution_engine(sys: Arc<dyn System>, root: HostPath, strategy: Arc<dyn SpawnStrategy>) -> Engine {
-    let mut engine = build_analysis_engine(sys, root);
-    razel_action::register_action_kinds(&mut engine, strategy);
+    build_execution_engine_with(
+        sys,
+        root,
+        strategy,
+        Arc::new(razel_action::SameTargetOrSourceResolver),
+        Arc::new(razel_action::InMemoryBlobStore::new()),
+    )
+}
+
+/// [`build_execution_engine`] with the two materializer seams caller-injected: the `InputResolver`
+/// (template input path → `ArtifactRef`, fail-closed) and the `BlobStore` (the ONE bytes home — callers
+/// keep their `Arc` handle to read produced bytes by digest).
+pub fn build_execution_engine_with(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    strategy: Arc<dyn SpawnStrategy>,
+    resolver: Arc<dyn razel_action::InputResolver>,
+    blobs: Arc<dyn razel_action::BlobStore>,
+) -> Engine {
+    let mut engine = build_analysis_engine(sys.clone(), root.clone());
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root);
     engine
 }
