@@ -21,6 +21,13 @@ razel-exec-api = { path = "../razel-exec-api", version = "0.1.0" }
 razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
 razel-bzl-starlark = { path = "../razel-bzl-starlark", version = "0.1.0" }  # IMPL — permitted: composition root
 
+[dev-dependencies]
+# The real `System` impl, for the REAL-execution proof (tests/local_exec.rs): a genrule-style spawn action
+# runs an ACTUAL subprocess over `DarwinSystem`, with incrementality driven directly against the `Engine`
+# (evaluate/Diff/recomputes — a razel-host-only surface). razel-host is a `root`, so wiring an impl is in
+# role; seams.json grants the (test-only) edge.
+razel-os-darwin = { path = "../razel-os-darwin", version = "0.1.0" }
+
 [features]
 # Pass-through so `cargo test -p razel-host --features <mutant>` drives a downstream mutant end-to-end
 # (turns the relevant integration test RED — red-first evidence for the protected property).
@@ -44,3 +51,11 @@ mutant_toolchain_exec_selection_first_candidate = ["razel-toolchain/mutant_toolc
 # build-verb slice (BAR-FIRST-SLICE execution leg): the emit is DROPPED — TARGET_COMPLETION is still
 # requested (the graph builds) but the produced output never reaches disk. Drives tests/build_slice.rs RED.
 mutant_build_skips_output_emit = []
+# real-execution leg (LocalSpawnStrategy). RED-FIRST: staging SKIPS an input file → the subprocess (a
+# genrule `cat <in> > <out>`) cannot read it, exits nonzero, and the spawn fails closed → the real-exec
+# proof (tests/local_exec.rs) goes RED. Never enable in a real build.
+mutant_stage_drops_input = []
+# real-execution leg (LocalSpawnStrategy). RED-FIRST (the local kin of mutant_exec_hardcodes_output):
+# collect returns FABRICATED bytes instead of READING the staged output file → the output-bytes assertion
+# fails → tests/local_exec.rs goes RED. Never enable in a real build.
+mutant_collect_fabricates_output = []

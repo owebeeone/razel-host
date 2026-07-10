@@ -20,6 +20,9 @@ use razel_toolchain::{Platform, RegisteredExecPlatform, ToolchainRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod local_exec;
+pub use local_exec::{DispatchStrategy, ExecRootPolicy, LocalSpawnStrategy};
+
 /// Build an `Engine` with the source-graph node-kinds (`FILE_STATE` / `FILE` / `DIRECTORY_LISTING` / `GLOB`)
 /// registered over `sys`, interpreting logical paths relative to `root`.
 pub fn build_source_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
@@ -249,6 +252,25 @@ impl BuildSession {
     /// Run `build <pattern>` to completion and emit the target's default outputs to disk (see [`run_build`]).
     pub fn build(&self, pattern: &str) -> Result<Vec<BuiltOutput>, Error> {
         run_build(&self.engine, self.blobs.as_ref(), self.sys.as_ref(), &self.root, pattern)
+    }
+
+    /// Build a session wired with the [`DispatchStrategy`] (write-actions → `WriteStrategy`; spawn-actions →
+    /// the REAL [`LocalSpawnStrategy`]) — the real-execution leg. `sys`/`root` feed the source tree (reads)
+    /// AND back the per-execution EXEC ROOTS the local strategy stages into and spawns in
+    /// (`temp_dir`/`create_dir_all`/`spawn`/`remove_dir_all`) AND receive the emitted outputs
+    /// (`write_atomic`) — one workspace filesystem. A genrule-style spawn action therefore runs a REAL
+    /// subprocess end to end (over the UDS socket via the daemon, incrementality intact); no consumer
+    /// rewrite from [`BuildSession::new_write`], only the host's strategy choice changes.
+    pub fn new_local(sys: Arc<dyn System>, root: HostPath) -> BuildSession {
+        let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
+        let engine = build_execution_engine_with(
+            sys.clone(),
+            root.clone(),
+            Arc::new(local_exec::DispatchStrategy::new(sys.clone())),
+            Arc::new(razel_action::SameTargetOrSourceResolver),
+            blobs.clone(),
+        );
+        BuildSession { engine, blobs, sys, root }
     }
 
     /// Re-run after a source edit was signaled to the engine (the caller dirties the changed leaf via the
