@@ -3,11 +3,19 @@
 //! node-kinds, and hands back a running graph. First assembly proving the seams compose end-to-end —
 //! a generic engine + an OS capability + build-domain node-kinds, wired with no consumer rewrite.
 
+use razel_action::{
+    derived_outputs, ArtifactRef, ArtifactValue, BlobStore, OutputSelection, TargetCompletionKey,
+};
+use razel_analysis::{ConfiguredTarget, ConfiguredTargetKey};
 use razel_bzl_api::BzlEvaluator;
 use razel_bzl_starlark::StarlarkEvaluator;
+use razel_core::{Error, NodeKey};
 use razel_engine::Engine;
+use razel_engine_api::DemandEngine;
 use razel_exec_api::SpawnStrategy;
+use razel_ids::RootRelativePath;
 use razel_os_api::{HostPath, System};
+use razel_source::join_root;
 use razel_toolchain::{Platform, RegisteredExecPlatform, ToolchainRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,4 +112,148 @@ pub fn build_execution_engine_with(
     let mut engine = build_analysis_engine(sys.clone(), root.clone());
     razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root);
     engine
+}
+
+// ──────────────── the `build` verb: request TARGET_COMPLETION, then EMIT the outputs to disk ────────────────
+
+/// One emitted output of a `build`: its exec-relative logical path and the host path it was written to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BuiltOutput {
+    pub exec_path: String,
+    pub host_path: HostPath,
+}
+impl BuiltOutput {
+    /// The emit destination as a plain `&str` — so a protocol root can render it WITHOUT naming
+    /// `razel_os_api::HostPath` (keeps `razel-daemon`'s non-test dep surface to {cli, comms, host, wire}).
+    pub fn host_path_str(&self) -> &str {
+        self.host_path.as_str()
+    }
+}
+
+/// Parse a v1 target PATTERN into a [`ConfiguredTargetKey`] (default configuration). Only the two Bazel
+/// forms the analysis layer already resolves are accepted — `//pkg:name` (absolute) and `//:name` (root
+/// package). Fail-closed (a typed `Error::Unsupported`, never a guess): a bare/relative name, a `:name`
+/// (this is a top-level pattern, not a dep label — no parent package to imply), and any recursive pattern
+/// (`...`) are rejected — v1 has no target expansion. The parse mirrors `razel_analysis::resolve_dep`'s
+/// `//pkg:name` split but is its own top-level entry point (that fn is analysis-private and dep-label-only).
+pub fn parse_target_pattern(pattern: &str) -> Result<ConfiguredTargetKey, Error> {
+    let unsupported = |detail: String| Error::Unsupported { what: "target pattern", detail };
+    let rest = pattern.strip_prefix("//").ok_or_else(|| {
+        unsupported(format!("expected an absolute label '//pkg:name', got '{pattern}' (v1 has no relative or bare-name patterns)"))
+    })?;
+    let (package, name) = match rest.split_once(':') {
+        Some((p, n)) if !n.is_empty() => (p.to_string(), n.to_string()),
+        _ => return Err(unsupported(format!("expected '//pkg:name', got '{pattern}'"))),
+    };
+    if package.contains("...") || name.contains("...") {
+        return Err(unsupported(format!("recursive patterns ('...') are not supported in v1: '{pattern}'")));
+    }
+    Ok(ConfiguredTargetKey { package, name, configuration: None, exec_platform: None, rule_transition: None })
+}
+
+/// Run `build <pattern>` over an execution `engine`, then EMIT the target's default outputs to disk. This is
+/// result-emission, NOT disk input-staging: v1 execution stays in-memory (R4) — only the FINAL requested
+/// outputs' bytes touch disk, fetched from the `blobs` CAS by digest and written via `System::write_atomic`
+/// (so it needs no os-system trait growth). The build itself is a pure graph consequence of requesting
+/// `TARGET_COMPLETION{ct, Default}` (CT → ARTIFACT → ACTION → strategy → digests); this fn adds only the
+/// emit leg. Fail-closed throughout: a bad pattern, a build error, an output whose digest the CAS never held
+/// (no Absorb), or a failed write are all typed `Error`s. Returns the emitted outputs (sorted by exec path).
+///
+/// `out_sys` + `out_root` are the emit destination (the same `System`/root that fed the source tree in v1,
+/// but taken explicitly so the emit target is never implicit). `blobs` is the handle the caller kept from
+/// [`build_execution_engine_with`] — the ONE bytes home the produced outputs landed in.
+pub fn run_build(
+    engine: &Engine,
+    blobs: &dyn BlobStore,
+    out_sys: &dyn System,
+    out_root: &HostPath,
+    pattern: &str,
+) -> Result<Vec<BuiltOutput>, Error> {
+    let ct = parse_target_pattern(pattern)?;
+
+    // (1) THE build: request TARGET_COMPLETION — the dep requests ARE the build (no hand bridge). A build
+    // error (analysis failure, dropped output, duplicate output, unresolvable input, …) surfaces here typed.
+    let tck = TargetCompletionKey { ct: ct.clone(), outputs: OutputSelection::Default };
+    engine.request(&NodeKey::from_key(&tck))?;
+
+    if cfg!(feature = "mutant_build_skips_output_emit") {
+        // MUTANT: the build verb requests TARGET_COMPLETION (so the graph builds) but DROPS the emit — the
+        // requested outputs never reach disk. `build_emits_requested_output_to_disk` goes red: the file is
+        // absent (read fails) and the content assertion never holds. The exact "we built it but never wrote
+        // it" gap the emit leg closes. Never enable in a real build.
+        return Ok(Vec::new());
+    }
+
+    // (2) enumerate the SAME default-output set completion built: request the CT, derive its outputs via the
+    // ONE shared pure fn (the R8 conflict pass — already run inside completion, so this cannot introduce a
+    // divergent set). This reuses the artifact model; it does not reshape it.
+    let ctv = engine.request(&NodeKey::from_key(&ct))?;
+    let configured = ctv.as_any().downcast_ref::<ConfiguredTarget>().ok_or_else(|| Error::Invalid {
+        what: "CONFIGURED_TARGET value".into(),
+        detail: format!("//{}:{} did not analyze to a ConfiguredTarget", ct.package, ct.name),
+    })?;
+    let refs: Vec<ArtifactRef> = derived_outputs(&ct, configured)?;
+
+    // (3) EMIT: for each output, project its ARTIFACT digest, fetch the bytes from the ONE home, write to
+    // disk. Fail-closed: a missing digest is a typed NotFound from the CAS (never empty bytes).
+    let mut built: Vec<BuiltOutput> = Vec::with_capacity(refs.len());
+    for aref in &refs {
+        let av = engine.request(&NodeKey::from_key(aref))?;
+        let artifact = av.as_any().downcast_ref::<ArtifactValue>().ok_or_else(|| Error::Invalid {
+            what: "ARTIFACT value".into(),
+            detail: format!("output '{}' did not project to an ArtifactValue", aref.exec_path),
+        })?;
+        let bytes = blobs.get(&artifact.digest)?;
+        let host_path = join_root(out_root, &RootRelativePath(artifact.exec_path.clone()));
+        out_sys.write_atomic(&host_path, &bytes).map_err(|e| Error::Invalid {
+            what: "emit build output".into(),
+            detail: format!("{}: {e:?}", artifact.exec_path),
+        })?;
+        built.push(BuiltOutput { exec_path: artifact.exec_path.clone(), host_path });
+    }
+    built.sort_by(|a, b| a.exec_path.cmp(&b.exec_path));
+    Ok(built)
+}
+
+/// A ready-to-serve build session: the composition root's bundle of everything a `build` needs — the
+/// execution `Engine`, the `BlobStore` handle (the ONE bytes home), and the emit `System` + root. The
+/// protocol root (`razel-daemon`) holds ONE of these and drives it per request; it lets the daemon call
+/// `session.build(pattern)` WITHOUT naming any engine / exec-api / os-api type (the wall holds at the
+/// razel-host library seam — the daemon's allow set is just {razel-cli, razel-comms, razel-host, wire-api}).
+///
+/// v1 wiring: the [`razel_exec_api::conformance::WriteStrategy`] (content-write actions) + an in-memory
+/// `BlobStore`. Swapping in a local/sandbox/remote strategy or an on-disk CAS is a host decision behind this
+/// same seam — no daemon rewrite.
+pub struct BuildSession {
+    engine: Engine,
+    blobs: Arc<dyn BlobStore>,
+    sys: Arc<dyn System>,
+    root: HostPath,
+}
+impl BuildSession {
+    /// Build a session over `sys`/`root` wired with the `WriteStrategy` (the write-action slice) and an
+    /// in-memory `BlobStore`. `sys` both feeds the source tree (reads) and receives the emitted outputs
+    /// (`write_atomic`) — the one workspace filesystem.
+    pub fn new_write(sys: Arc<dyn System>, root: HostPath) -> BuildSession {
+        let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
+        let engine = build_execution_engine_with(
+            sys.clone(),
+            root.clone(),
+            Arc::new(razel_exec_api::conformance::WriteStrategy),
+            Arc::new(razel_action::SameTargetOrSourceResolver),
+            blobs.clone(),
+        );
+        BuildSession { engine, blobs, sys, root }
+    }
+
+    /// Run `build <pattern>` to completion and emit the target's default outputs to disk (see [`run_build`]).
+    pub fn build(&self, pattern: &str) -> Result<Vec<BuiltOutput>, Error> {
+        run_build(&self.engine, self.blobs.as_ref(), self.sys.as_ref(), &self.root, pattern)
+    }
+
+    /// Re-run after a source edit was signaled to the engine (the caller dirties the changed leaf via the
+    /// engine `Diff`); exposed so incrementality can be exercised over a WARM session. Same emit semantics.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
 }
