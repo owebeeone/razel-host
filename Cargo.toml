@@ -51,6 +51,10 @@ mutant_toolchain_exec_selection_first_candidate = ["razel-toolchain/mutant_toolc
 # rust-rules wave passthroughs: drive the two new mutants over the composition root (tests/rust_rules.rs +
 # tests/pkg_loads.rs — the rustc chaining proof and the //pkg load-resolution proof go RED).
 mutant_chain_drops_dep_files = ["razel-analysis/mutant_chain_drops_dep_files"]
+# self-host wave: drive the transitive-merge mutant over the composition root (tests/self_host.rs — razel
+# building its OWN real razel-wire-cbor → razel-wire-api → razel-core chain goes RED when a dep-of-dep rlib
+# can no longer resolve to its producer).
+mutant_transitive_outputs_not_merged = ["razel-analysis/mutant_transitive_outputs_not_merged"]
 mutant_load_pkg_resolution_absorbs = ["razel-load/mutant_load_pkg_resolution_absorbs"]
 # build-verb slice (BAR-FIRST-SLICE execution leg): the emit is DROPPED — TARGET_COMPLETION is still
 # requested (the graph builds) but the produced output never reaches disk. Drives tests/build_slice.rs RED.
