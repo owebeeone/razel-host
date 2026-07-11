@@ -476,12 +476,16 @@ fn self_load_is_detected() {
 
 #[test]
 fn unsupported_load_form_is_rejected() {
+    // The specimen moved with the rust-rules wave: `//pkg:file.bzl` is now a SUPPORTED absolute form
+    // (razel-load's C8 first slice — see tests/pkg_loads.rs), so the still-unsupported REPO-MAPPED form
+    // (`@repo//...` — no repo mapping in v1) carries this pin now. The property is unchanged: an
+    // unsupported load form fails loudly (Unsupported), never silently mis-resolves to a wrong path.
     let fs = Arc::new(MutFs::new());
-    fs.set("/w/pkg/a.bzl", b"load(\"//other:f.bzl\", \"z\")\nx = 1\n", 1);
+    fs.set("/w/pkg/a.bzl", b"load(\"@repo//other:f.bzl\", \"z\")\nx = 1\n", 1);
     let engine = build_loading_engine(fs, HostPath::new("/w"));
     assert!(
         matches!(engine.request(&bkey("pkg/a.bzl")), Err(razel_core::Error::Unsupported { .. })),
-        "a Bazel-label load form must fail loudly (Unsupported), never silently mis-resolve to a wrong path"
+        "a repo-mapped load form must fail loudly (Unsupported), never silently mis-resolve to a wrong path"
     );
 }
 

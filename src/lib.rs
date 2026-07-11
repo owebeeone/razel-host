@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 pub mod local_exec;
 pub use local_exec::{DispatchStrategy, ExecRootPolicy, LocalSpawnStrategy};
+pub mod rust_toolchain;
+pub use rust_toolchain::{discover_rustc, rust_toolchain, HOST_CONFIG, RUST_TOOLCHAIN_TYPE};
 
 /// Build an `Engine` with the source-graph node-kinds (`FILE_STATE` / `FILE` / `DIRECTORY_LISTING` / `GLOB`)
 /// registered over `sys`, interpreting logical paths relative to `root`.
@@ -117,6 +119,26 @@ pub fn build_execution_engine_with(
     engine
 }
 
+/// [`build_execution_engine_with`] plus the toolchain wiring of `build_analysis_engine_with_toolchains`:
+/// the full stack (loading → analysis → toolchains → execution) with the registration registry handle
+/// returned so the caller can SEED it (e.g. the discovered rust toolchain under [`rust_toolchain::HOST_CONFIG`])
+/// and mutate it against the running engine.
+#[allow(clippy::too_many_arguments)]
+pub fn build_execution_engine_with_toolchains(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    strategy: Arc<dyn SpawnStrategy>,
+    resolver: Arc<dyn razel_action::InputResolver>,
+    blobs: Arc<dyn razel_action::BlobStore>,
+    platforms: HashMap<String, Platform>,
+    host_platform: RegisteredExecPlatform,
+) -> (Engine, Arc<ToolchainRegistry>) {
+    let (mut engine, registry) =
+        build_analysis_engine_with_toolchains(sys.clone(), root.clone(), platforms, host_platform);
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root);
+    (engine, registry)
+}
+
 // ──────────────── the `build` verb: request TARGET_COMPLETION, then EMIT the outputs to disk ────────────────
 
 /// One emitted output of a `build`: its exec-relative logical path and the host path it was written to.
@@ -172,7 +194,23 @@ pub fn run_build(
     out_root: &HostPath,
     pattern: &str,
 ) -> Result<Vec<BuiltOutput>, Error> {
-    let ct = parse_target_pattern(pattern)?;
+    run_build_configured(engine, blobs, out_sys, out_root, pattern, None)
+}
+
+/// [`run_build`] under an explicit session CONFIGURATION: the parsed pattern's `configuration` dimension is
+/// set to `configuration` before the build (a toolchain-requiring target — e.g. a rust rule — cannot resolve
+/// with `None`: the ratified fail-closed decision, never absorbed to a default inside analysis). Additive:
+/// `run_build` delegates with `None`, keeping the pre-toolchain call shape byte-identical.
+pub fn run_build_configured(
+    engine: &Engine,
+    blobs: &dyn BlobStore,
+    out_sys: &dyn System,
+    out_root: &HostPath,
+    pattern: &str,
+    configuration: Option<&str>,
+) -> Result<Vec<BuiltOutput>, Error> {
+    let mut ct = parse_target_pattern(pattern)?;
+    ct.configuration = configuration.map(|s| s.to_string());
 
     // (1) THE build: request TARGET_COMPLETION — the dep requests ARE the build (no hand bridge). A build
     // error (analysis failure, dropped output, duplicate output, unresolvable input, …) surfaces here typed.
@@ -232,6 +270,9 @@ pub struct BuildSession {
     blobs: Arc<dyn BlobStore>,
     sys: Arc<dyn System>,
     root: HostPath,
+    /// The session's default CONFIGURATION, applied to every parsed pattern (`None` = the pre-toolchain
+    /// shape; `Some(HOST_CONFIG)` for a toolchain-enabled session — resolution requires a configuration).
+    configuration: Option<String>,
 }
 impl BuildSession {
     /// Build a session over `sys`/`root` wired with the `WriteStrategy` (the write-action slice) and an
@@ -246,12 +287,20 @@ impl BuildSession {
             Arc::new(razel_action::SameTargetOrSourceResolver),
             blobs.clone(),
         );
-        BuildSession { engine, blobs, sys, root }
+        BuildSession { engine, blobs, sys, root, configuration: None }
     }
 
-    /// Run `build <pattern>` to completion and emit the target's default outputs to disk (see [`run_build`]).
+    /// Run `build <pattern>` to completion and emit the target's default outputs to disk (see [`run_build`]),
+    /// under the session's configuration (if any).
     pub fn build(&self, pattern: &str) -> Result<Vec<BuiltOutput>, Error> {
-        run_build(&self.engine, self.blobs.as_ref(), self.sys.as_ref(), &self.root, pattern)
+        run_build_configured(
+            &self.engine,
+            self.blobs.as_ref(),
+            self.sys.as_ref(),
+            &self.root,
+            pattern,
+            self.configuration.as_deref(),
+        )
     }
 
     /// Build a session wired with the [`DispatchStrategy`] (write-actions → `WriteStrategy`; spawn-actions →
@@ -270,7 +319,41 @@ impl BuildSession {
             Arc::new(razel_action::SameTargetOrSourceResolver),
             blobs.clone(),
         );
-        BuildSession { engine, blobs, sys, root }
+        BuildSession { engine, blobs, sys, root, configuration: None }
+    }
+
+    /// [`BuildSession::new_local`] plus the RUST toolchain (the rust-rules wave): rustc is DISCOVERED at
+    /// this composition root ([`discover_rustc`] — `$RUSTC` else the well-known probes, fail-closed typed
+    /// error if none), registered as the `"rust"` toolchain type under [`rust_toolchain::HOST_CONFIG`], and
+    /// the session configuration is set to `HOST_CONFIG` so toolchain resolution has the configuration it
+    /// requires. A `rust_library`/`rust_binary` build (`rules/rust/rust.bzl` in the workspace) then runs
+    /// REAL `rustc` subprocesses through the same DispatchStrategy → LocalSpawnStrategy leg — over the UDS
+    /// socket via the daemon with no daemon rewrite (the strategy + registry are session wiring).
+    pub fn new_local_rust(sys: Arc<dyn System>, root: HostPath) -> Result<BuildSession, Error> {
+        let rustc = rust_toolchain::discover_rustc(sys.as_ref())?;
+        let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
+        let mut platforms = HashMap::new();
+        platforms.insert(rust_toolchain::HOST_CONFIG.to_string(), Platform { constraints: Vec::new() });
+        let (engine, registry) = build_execution_engine_with_toolchains(
+            sys.clone(),
+            root.clone(),
+            Arc::new(local_exec::DispatchStrategy::new(sys.clone())),
+            Arc::new(razel_action::SameTargetOrSourceResolver),
+            blobs.clone(),
+            platforms,
+            RegisteredExecPlatform { name: "host".to_string(), constraints: Vec::new() },
+        );
+        registry.set_toolchains(
+            &razel_ids::ConfigId(rust_toolchain::HOST_CONFIG.to_string()),
+            vec![rust_toolchain::rust_toolchain(&rustc)],
+        );
+        Ok(BuildSession {
+            engine,
+            blobs,
+            sys,
+            root,
+            configuration: Some(rust_toolchain::HOST_CONFIG.to_string()),
+        })
     }
 
     /// Re-run after a source edit was signaled to the engine (the caller dirties the changed leaf via the

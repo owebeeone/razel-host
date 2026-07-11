@@ -48,6 +48,10 @@ mutant_input_resolver_absorbs_unknown = ["razel-action/mutant_input_resolver_abs
 mutant_toolchain_ignores_constraints = ["razel-toolchain/mutant_toolchain_ignores_constraints"]
 mutant_toolchain_registered_set_not_a_dep = ["razel-toolchain/mutant_toolchain_registered_set_not_a_dep"]
 mutant_toolchain_exec_selection_first_candidate = ["razel-toolchain/mutant_toolchain_exec_selection_first_candidate"]
+# rust-rules wave passthroughs: drive the two new mutants over the composition root (tests/rust_rules.rs +
+# tests/pkg_loads.rs — the rustc chaining proof and the //pkg load-resolution proof go RED).
+mutant_chain_drops_dep_files = ["razel-analysis/mutant_chain_drops_dep_files"]
+mutant_load_pkg_resolution_absorbs = ["razel-load/mutant_load_pkg_resolution_absorbs"]
 # build-verb slice (BAR-FIRST-SLICE execution leg): the emit is DROPPED — TARGET_COMPLETION is still
 # requested (the graph builds) but the produced output never reaches disk. Drives tests/build_slice.rs RED.
 mutant_build_skips_output_emit = []
