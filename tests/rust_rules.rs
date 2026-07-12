@@ -94,77 +94,80 @@ impl SpawnStrategy for RecordingLocal {
 // the declared env carries `PATH=/usr/bin:/bin` for rustc's linker discovery (declared data, in the 8-dim
 // fingerprint; no host inheritance). Single-file srcs this wave (multi-file/module crates = next wave):
 // a multi-src call fails LOUD in the impl.
-const RUST_BZL: &str = r#"def _pkg(label):
-    return label.split(":")[0][2:]
+const RUST_BZL: &str = r#"RustInfo = provider(
+    doc = "Transitive rlib propagation for the hand-written rust ruleset.",
+    fields = {"crate_name": "", "rlib": "", "transitive_rlibs": ""},
+)
 
-def _name(label):
-    return label.split(":")[1]
+_RUST_ENV = {"PATH": "/usr/bin:/bin"}
 
-def _one_src(ctx):
-    if ctx.attr.srcs == None or len(ctx.attr.srcs) != 1:
-        fail("rust rules support exactly ONE src per target in this wave (multi-file crates are the next wave): " + ctx.label)
-    return _pkg(ctx.label) + "/" + ctx.attr.srcs[0]
-
-def _extern_args(ctx):
-    flags = []
-    inputs = []
-    dirs = []
-    for d in ctx.attr.deps:
-        for f in d[DefaultInfo].files:
-            parts = f.split("/")
-            base = parts[-1]
-            if not base.startswith("lib") or not base.endswith(".rlib"):
-                fail("rust dep file is not an rlib: " + f)
-            crate = base[3:-5]
-            flags += ["--extern", crate + "=" + f]
-            dir = "/".join(parts[:-1]) if len(parts) > 1 else "."
-            if dir not in dirs:
-                dirs += [dir]
-                flags += ["-L", "dependency=" + dir]
-            inputs += [f]
-    return flags, inputs
+def _compile(ctx, crate_type, out):
+    tc = ctx.toolchains["//rules/rust:toolchain_type"]
+    srcs = ctx.files.srcs
+    if not srcs:
+        fail("rust rule needs at least one src (crate root listed first): %s" % ctx.label)
+    crate_root = srcs[0]
+    extern_args = []
+    dep_transitive = []
+    for dep in ctx.attr.deps:
+        info = dep[RustInfo]
+        extern_args.append("--extern")
+        extern_args.append("%s=%s" % (info.crate_name, info.rlib.path))
+        dep_transitive.append(info.transitive_rlibs)
+    dep_rlibs = depset(transitive = dep_transitive)
+    lib_dir_args = []
+    seen = {}
+    for f in dep_rlibs.to_list():
+        d = f.dirname
+        if d not in seen:
+            seen[d] = True
+            lib_dir_args.append("-L")
+            lib_dir_args.append("dependency=%s" % d)
+    args = ctx.actions.args()
+    args.add("--edition=2021")
+    args.add("--crate-type=" + crate_type)
+    args.add("--crate-name", ctx.label.name)
+    args.add(crate_root.path)
+    args.add("-o", out.path)
+    args.add_all(extern_args)
+    args.add_all(lib_dir_args)
+    ctx.actions.run(
+        executable = tc.rustc,
+        arguments = [args],
+        inputs = depset(direct = srcs, transitive = dep_transitive),
+        outputs = [out],
+        mnemonic = "Rustc",
+        progress_message = "Rustc %s %s" % (crate_type, ctx.label),
+        env = _RUST_ENV,
+        use_default_shell_env = False,
+    )
 
 def _rust_library_impl(ctx):
-    name = _name(ctx.label)
-    src = _one_src(ctx)
-    out = _pkg(ctx.label) + "/lib" + name + ".rlib"
-    flags, dep_inputs = _extern_args(ctx)
-    tc = ctx.toolchains["rust"]
-    declare_action(
-        mnemonic = "Rustc",
-        argv = [tc.rustc, "--edition=2021", "--crate-type=rlib", "--crate-name", name, src, "-o", out] + flags,
-        inputs = [src] + dep_inputs,
-        outputs = [out],
-        env = {"PATH": "/usr/bin:/bin"},
+    out = ctx.actions.declare_file("lib%s.rlib" % ctx.label.name)
+    _compile(ctx, "rlib", out)
+    transitive = depset(
+        direct = [out],
+        transitive = [dep[RustInfo].transitive_rlibs for dep in ctx.attr.deps],
     )
-    return [DefaultInfo(files = [out])]
+    return [
+        DefaultInfo(files = depset([out])),
+        RustInfo(crate_name = ctx.label.name, rlib = out, transitive_rlibs = transitive),
+    ]
 
 def _rust_binary_impl(ctx):
-    name = _name(ctx.label)
-    src = _one_src(ctx)
-    out = _pkg(ctx.label) + "/" + name
-    flags, dep_inputs = _extern_args(ctx)
-    tc = ctx.toolchains["rust"]
-    declare_action(
-        mnemonic = "Rustc",
-        argv = [tc.rustc, "--edition=2021", "--crate-type=bin", "--crate-name", name, src, "-o", out] + flags,
-        inputs = [src] + dep_inputs,
-        outputs = [out],
-        env = {"PATH": "/usr/bin:/bin"},
-    )
-    return [DefaultInfo(files = [out])]
+    out = ctx.actions.declare_file(ctx.label.name)
+    _compile(ctx, "bin", out)
+    return [DefaultInfo(files = depset([out]), executable = out)]
 
-rust_library = rule(
-    implementation = _rust_library_impl,
-    attrs = {"srcs": attr.string_list(), "deps": attr.label_list()},
-    toolchains = ["rust"],
-)
+_ATTRS = {
+    "srcs": attr.label_list(allow_files = [".rs"]),
+    "deps": attr.label_list(providers = [RustInfo]),
+}
 
-rust_binary = rule(
-    implementation = _rust_binary_impl,
-    attrs = {"srcs": attr.string_list(), "deps": attr.label_list()},
-    toolchains = ["rust"],
-)
+rust_library = rule(implementation = _rust_library_impl, attrs = _ATTRS,
+                    toolchains = ["//rules/rust:toolchain_type"])
+rust_binary = rule(implementation = _rust_binary_impl, attrs = _ATTRS,
+                   toolchains = ["//rules/rust:toolchain_type"], executable = True)
 "#;
 
 const HELLO_BUILD: &str = r#"load("//rules/rust:rust.bzl", "rust_binary", "rust_library")
@@ -397,6 +400,45 @@ fn rust_chaining_granular_incrementality() {
             out,
             "bin-v2 says: hello from razel rust v2 — a longer edited revision\n".as_bytes().to_vec(),
             "the re-run binary observes BOTH source edits through the incremental rebuild"
+        );
+
+        let _ = sys.remove_dir_all(&HostPath::new(root));
+    });
+}
+
+#[test]
+fn rust_bzl_content_edit_preserving_templates_recompiles_zero() {
+    // T17-C RECOMPUTE MEASUREMENT: the rust.bzl conversion (declare_action → ctx.actions.run + Label/File)
+    // is a .bzl CONTENT change that projects the SAME frozen ActionTemplates. So a warm rebuild after editing
+    // rust.bzl (here a template-preserving comment append) must re-run ZERO rustc actions — any CT
+    // re-analysis early-cuts at the unchanged action fingerprints. This directly measures the claim.
+    hang_proof(|| {
+        let sys: Arc<dyn System> = Arc::new(DarwinSystem);
+        let Some(rustc) = rustc_or_skip(sys.as_ref()) else { return };
+        let root = unique_root();
+        write_fixture(sys.as_ref(), &root);
+
+        let spawned = Arc::new(Mutex::new(Vec::new()));
+        let (engine, _blobs) = make_engine(sys.clone(), &root, &rustc, spawned.clone());
+        let tc = completion("hello_bin");
+
+        engine.request(&tc).expect("cold build");
+        let cold = spawned.lock().unwrap().len();
+        assert_eq!(cold, 2, "cold: exactly the two rustc actions (lib + bin)");
+
+        // Edit rust.bzl: content bytes change, the projected templates do NOT.
+        let edited = format!("{}\n# T17-C: template-preserving comment edit\n", RUST_BZL);
+        sys.write_atomic(&HostPath::new(format!("{root}/rules/rust/rust.bzl")), edited.as_bytes()).expect("edit rust.bzl");
+        engine.evaluate(
+            &[tc.clone()],
+            FailurePolicy::FailFast,
+            Diff { changed: vec![ChangedLeaf::ChangedWithoutValue(fskey("rules/rust/rust.bzl"))] },
+        );
+        let recompiled = spawned.lock().unwrap().len() - cold;
+        assert_eq!(
+            recompiled, 0,
+            "a template-preserving rust.bzl edit re-runs ZERO rustc — early cutoff at the unchanged action \
+             templates (measured: {recompiled} rustc re-spawns)"
         );
 
         let _ = sys.remove_dir_all(&HostPath::new(root));

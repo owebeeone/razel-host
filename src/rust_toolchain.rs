@@ -2,8 +2,16 @@
 //! wave): rustc DISCOVERY at the composition root (the only layer allowed to consult the ambient host —
 //! `System::raw_env` / `System::stat` — per its `root` role) and the [`RegisteredToolchain`] row that puts
 //! the discovered compiler into the ADR-0010 host-injected registry. The rules themselves are DATA
-//! (`rules/rust/rust.bzl` in the workspace under build): a rule declares `toolchains = ["rust"]`, analysis
-//! resolves it through the TOOLCHAIN_CONTEXT node, and the impl reads `ctx.toolchains["rust"].rustc`.
+//! (`rules/rust/rust.bzl` in the workspace under build): a rule declares
+//! `toolchains = ["//rules/rust:toolchain_type"]` (C6 — the label key that also drives real Bazel), analysis
+//! resolves it through the TOOLCHAIN_CONTEXT node, and the impl reads
+//! `ctx.toolchains["//rules/rust:toolchain_type"].rustc`.
+//!
+//! This INJECTION path is the "test composition" seam (C6): `rust_toolchain(rustc)` builds a
+//! `RegisteredToolchain` under the toolchain-type LABEL carrying `platform_common.ToolchainInfo(rustc=…)` —
+//! the identity the `.bzl` `rust_toolchain` rule produces, so the injected and the over-the-root
+//! (MODULE.bazel-driven) resolution agree. The discovered rustc path matches the rules/rust/BUILD.bazel
+//! pin (both `/Users/owebeeone/.cargo/bin/rustc` on this host) so razel and Bazel do not fork the action.
 //!
 //! Fail-closed: no discoverable rustc is a typed `Error::NotFound` — never a guessed path, never a bare
 //! "rustc" left to a PATH lookup at spawn time (the local strategy takes an ABSOLUTE argv[0], the /bin/sh
@@ -15,10 +23,12 @@ use razel_core::Error;
 use razel_os_api::{EnvName, HostPath, System};
 use razel_toolchain::{RegisteredToolchain, ToolchainType};
 
-/// The toolchain TYPE id a rust rule requires (`rule(toolchains = ["rust"])`).
-pub const RUST_TOOLCHAIN_TYPE: &str = "rust";
-/// The provider the resolved rust toolchain carries (`ctx.toolchains["rust"]`).
-pub const RUST_TOOLCHAIN_INFO: &str = "RustToolchainInfo";
+/// The toolchain TYPE id a rust rule requires (`rule(toolchains = ["//rules/rust:toolchain_type"])`) — the
+/// Appendix-A LABEL both razel and real Bazel key on (C6; was the v1 name-key `"rust"`).
+pub const RUST_TOOLCHAIN_TYPE: &str = "//rules/rust:toolchain_type";
+/// The provider the resolved rust toolchain carries (`ctx.toolchains[<type>]`) — `platform_common.ToolchainInfo`
+/// (C6; was the ad-hoc `RustToolchainInfo`). One identity for the injected row and the `.bzl` rust_toolchain rule.
+pub const RUST_TOOLCHAIN_INFO: &str = "ToolchainInfo";
 /// Its one v1 field: the discovered rustc as an absolute host path string (argv[0] of every Rustc action).
 pub const RUSTC_FIELD: &str = "rustc";
 /// The v1 session configuration name a rust build runs under (toolchain resolution REQUIRES a
@@ -62,9 +72,9 @@ pub fn discover_rustc(sys: &dyn System) -> Result<HostPath, Error> {
     })
 }
 
-/// The registry row for the discovered compiler: type `"rust"`, compatible with ANY target/exec platform in
-/// v1 (empty constraint sets), carrying `RustToolchainInfo { rustc: <abs path> }`. Seed it under the session
-/// configuration: `registry.set_toolchains(&ConfigId(HOST_CONFIG.into()), vec![rust_toolchain(&rustc)])`.
+/// The registry row for the discovered compiler: type `//rules/rust:toolchain_type` (C6), compatible with ANY
+/// target/exec platform in v1 (empty constraint sets), carrying `ToolchainInfo { rustc: <abs path> }`. Seed it
+/// under the session configuration: `registry.set_toolchains(&ConfigId(HOST_CONFIG.into()), vec![rust_toolchain(&rustc)])`.
 pub fn rust_toolchain(rustc: &HostPath) -> RegisteredToolchain {
     RegisteredToolchain {
         toolchain_type: ToolchainType(RUST_TOOLCHAIN_TYPE.to_string()),

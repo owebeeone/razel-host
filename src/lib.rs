@@ -6,7 +6,7 @@
 use razel_action::{
     derived_outputs, ArtifactRef, ArtifactValue, BlobStore, OutputSelection, TargetCompletionKey,
 };
-use razel_analysis::{ConfiguredTarget, ConfiguredTargetKey};
+use razel_analysis::{ConfiguredTarget, ConfiguredTargetKey, SelectConfig};
 use razel_bzl_api::BzlEvaluator;
 use razel_bzl_starlark::StarlarkEvaluator;
 use razel_core::{Error, NodeKey};
@@ -24,12 +24,22 @@ pub mod local_exec;
 pub use local_exec::{DispatchStrategy, ExecRootPolicy, LocalSpawnStrategy};
 pub mod rust_toolchain;
 pub use rust_toolchain::{discover_rustc, rust_toolchain, HOST_CONFIG, RUST_TOOLCHAIN_TYPE};
+pub mod workspace;
+pub use workspace::{discover_workspace_root, WORKSPACE_MARKER};
+pub mod module_config;
+pub use module_config::{
+    module_external_repos, read_module_file, resolve_module_toolchains, workspace_repos, MODULE_FILE,
+};
+
+/// The external-source-roots registry vocabulary (T17), re-exported so a protocol root (`razel-daemon`) can
+/// seed/inject it WITHOUT naming `razel-source` (keeps the daemon's dep surface to {cli, comms, host, wire}).
+pub use razel_source::{ExternalRepo, ExternalRepos};
 
 /// Build an `Engine` with the source-graph node-kinds (`FILE_STATE` / `FILE` / `DIRECTORY_LISTING` / `GLOB`)
 /// registered over `sys`, interpreting logical paths relative to `root`.
 pub fn build_source_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
     let mut engine = Engine::new();
-    razel_source::register_source_kinds(&mut engine, sys, root);
+    razel_source::register_source_kinds(&mut engine, sys, root, ExternalRepos::empty());
     engine
 }
 
@@ -37,11 +47,20 @@ pub fn build_source_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
 /// real Starlark evaluator. This is the assembly that spans the OS seam, the engine, and the Starlark seam:
 /// source files → `.bzl` modules → packages of targets, all on the one incremental engine.
 pub fn build_loading_engine(sys: Arc<dyn System>, root: HostPath) -> Engine {
+    build_loading_engine_with_repos(sys, root, ExternalRepos::empty())
+}
+
+/// [`build_loading_engine`] with the T17/T20 external-source-roots `repos` registry injected — the loading
+/// slice (`FILE`/`BZL_LOAD`/`PACKAGE`) resolving `@<repo>//…` label loads + `external/<repo>/…` exec reads
+/// through `repos`. Empty `repos` is byte-identical to `build_loading_engine`. Used to drive `.bzl` load
+/// resolution over an injected ruleset registry (the T20 R1 `@rules_rust//rust:defs.bzl` path) without the
+/// analysis/execution layers.
+pub fn build_loading_engine_with_repos(sys: Arc<dyn System>, root: HostPath, repos: ExternalRepos) -> Engine {
     let mut engine = Engine::new();
-    razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone());
+    razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone(), repos.clone());
     let eval: Arc<dyn BzlEvaluator> = Arc::new(StarlarkEvaluator::new());
-    razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
-    razel_package::register_package_kinds(&mut engine, sys, root, eval);
+    razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone(), repos.clone());
+    razel_package::register_package_kinds(&mut engine, sys, root, eval, repos);
     engine
 }
 
@@ -74,15 +93,61 @@ pub fn build_analysis_engine_with_toolchains(
     platforms: HashMap<String, Platform>,
     host_platform: RegisteredExecPlatform,
 ) -> (Engine, Arc<ToolchainRegistry>) {
+    analysis_engine_with_repos(sys, root, ExternalRepos::empty(), platforms, host_platform)
+}
+
+/// The loading+analysis+toolchain wiring, parameterized by the external-repo `repos` registry (the T17
+/// external-source-roots injection point). The public `build_analysis_engine_with_toolchains` delegates here
+/// with an EMPTY registry (so every existing internal-only caller is byte-identical); the `*_repos` execution
+/// builders below thread a seeded registry through the SAME 5 registrars.
+fn analysis_engine_with_repos(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    repos: ExternalRepos,
+    platforms: HashMap<String, Platform>,
+    host_platform: RegisteredExecPlatform,
+) -> (Engine, Arc<ToolchainRegistry>) {
+    // Default select-config: the per-configuration CONSTRAINT set derived from the SAME `platforms` map the
+    // toolchain path uses (single source of truth — a config's target platform constraints serve BOTH
+    // toolchain resolution and select()/config_setting matching), with EMPTY `values`. The `values`-based
+    // TF path uses `analysis_engine_with_repos_and_select`.
+    let select_config = select_config_from_platforms(&platforms);
+    analysis_engine_with_repos_and_select(sys, root, repos, platforms, host_platform, select_config)
+}
+
+/// [`analysis_engine_with_repos`] with an EXPLICIT [`SelectConfig`] (T20 select) — the `values`-carrying path
+/// (a `config_setting(values = {"cpu": …})` matches against the injected per-configuration values). The
+/// constraint side still typically mirrors `platforms`; the caller composes both.
+fn analysis_engine_with_repos_and_select(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    repos: ExternalRepos,
+    platforms: HashMap<String, Platform>,
+    host_platform: RegisteredExecPlatform,
+    select_config: SelectConfig,
+) -> (Engine, Arc<ToolchainRegistry>) {
     let mut engine = Engine::new();
-    razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone());
+    razel_source::register_source_kinds(&mut engine, sys.clone(), root.clone(), repos.clone());
     let eval: Arc<dyn BzlEvaluator> = Arc::new(StarlarkEvaluator::new());
-    razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
-    razel_package::register_package_kinds(&mut engine, sys.clone(), root.clone(), eval.clone());
-    razel_analysis::register_analysis_kinds(&mut engine, sys, root, eval);
+    razel_load::register_load_kinds(&mut engine, sys.clone(), root.clone(), eval.clone(), repos.clone());
+    razel_package::register_package_kinds(&mut engine, sys.clone(), root.clone(), eval.clone(), repos.clone());
+    razel_analysis::register_analysis_kinds(&mut engine, sys, root, eval, repos, select_config);
     let registry = Arc::new(ToolchainRegistry::new());
     razel_toolchain::register_toolchain_kinds(&mut engine, registry.clone(), platforms, host_platform);
     (engine, registry)
+}
+
+/// Derive a [`SelectConfig`] from the platform DEFINITIONS: each configuration's constraint_value LABELS
+/// become its select constraint set (the ONE source of truth — a config's constraints serve both toolchain
+/// and select resolution). `values` are empty (the `--define`/`--cpu`-style path is injected explicitly).
+fn select_config_from_platforms(platforms: &HashMap<String, Platform>) -> SelectConfig {
+    SelectConfig {
+        platforms: platforms
+            .iter()
+            .map(|(name, p)| (name.clone(), p.constraints.iter().map(|c| c.0.clone()).collect()))
+            .collect(),
+        values: HashMap::new(),
+    }
 }
 
 /// Build an `Engine` registering loading, analysis AND the execution node-kinds of the artifact-model
@@ -115,7 +180,7 @@ pub fn build_execution_engine_with(
     blobs: Arc<dyn razel_action::BlobStore>,
 ) -> Engine {
     let mut engine = build_analysis_engine(sys.clone(), root.clone());
-    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root);
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root, ExternalRepos::empty());
     engine
 }
 
@@ -135,8 +200,98 @@ pub fn build_execution_engine_with_toolchains(
 ) -> (Engine, Arc<ToolchainRegistry>) {
     let (mut engine, registry) =
         build_analysis_engine_with_toolchains(sys.clone(), root.clone(), platforms, host_platform);
-    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root);
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root, ExternalRepos::empty());
     (engine, registry)
+}
+
+/// [`build_execution_engine_with_toolchains`] with the T17 external-source-roots registry injected — the
+/// full stack (loading → analysis → toolchains → execution) resolving `@<repo>//…` labels + `external/<repo>/…`
+/// exec paths through `repos`. The self-host acceptance build (`//razel-cli:razel`, whose `razel-comms` leg
+/// depends on the external `taut-shape` crate) is driven through this builder; an empty `repos` is
+/// byte-identical to `build_execution_engine_with_toolchains`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_execution_engine_with_toolchains_and_repos(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    repos: ExternalRepos,
+    strategy: Arc<dyn SpawnStrategy>,
+    resolver: Arc<dyn razel_action::InputResolver>,
+    blobs: Arc<dyn razel_action::BlobStore>,
+    platforms: HashMap<String, Platform>,
+    host_platform: RegisteredExecPlatform,
+) -> (Engine, Arc<ToolchainRegistry>) {
+    let (mut engine, registry) =
+        analysis_engine_with_repos(sys.clone(), root.clone(), repos.clone(), platforms, host_platform);
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root, repos);
+    (engine, registry)
+}
+
+/// [`build_execution_engine_with_toolchains_and_repos`] with an EXPLICIT [`SelectConfig`] (T20 select) — the
+/// full stack (loading → analysis → toolchains → execution) resolving `select()`/`config_setting` against the
+/// injected per-configuration constraint set + `values`. Used by the TF-shaped `values`-based driving proof
+/// (and any build needing the `--cpu`/`--compilation_mode` match surface); the constraint-only path derives
+/// its SelectConfig from `platforms` automatically via [`build_execution_engine_with_toolchains_and_repos`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_execution_engine_with_toolchains_repos_and_select(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    repos: ExternalRepos,
+    strategy: Arc<dyn SpawnStrategy>,
+    resolver: Arc<dyn razel_action::InputResolver>,
+    blobs: Arc<dyn razel_action::BlobStore>,
+    platforms: HashMap<String, Platform>,
+    host_platform: RegisteredExecPlatform,
+    select_config: SelectConfig,
+) -> (Engine, Arc<ToolchainRegistry>) {
+    let (mut engine, registry) = analysis_engine_with_repos_and_select(
+        sys.clone(),
+        root.clone(),
+        repos.clone(),
+        platforms,
+        host_platform,
+        select_config,
+    );
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root, repos);
+    (engine, registry)
+}
+
+/// [`build_execution_engine_with`] with the T17 external-source-roots registry injected (no toolchains — the
+/// write-action / non-rust leg, used by [`BuildSession::new_write`]/`new_local`). Empty `repos` is
+/// byte-identical to `build_execution_engine_with`.
+pub fn build_execution_engine_with_repos(
+    sys: Arc<dyn System>,
+    root: HostPath,
+    repos: ExternalRepos,
+    strategy: Arc<dyn SpawnStrategy>,
+    resolver: Arc<dyn razel_action::InputResolver>,
+    blobs: Arc<dyn razel_action::BlobStore>,
+) -> Engine {
+    let (mut engine, _registry) = analysis_engine_with_repos(
+        sys.clone(),
+        root.clone(),
+        repos.clone(),
+        HashMap::new(),
+        RegisteredExecPlatform { name: "host".to_string(), constraints: Vec::new() },
+    );
+    razel_action::register_action_kinds(&mut engine, strategy, resolver, blobs, sys, root, repos);
+    engine
+}
+
+/// The T17 Phase-A seed (D6: injected registry, seeded `taut-shape`). Maps the apparent repo `taut-shape` to
+/// its external source root (`taut-shape-rs/crates/taut-shape`, anchored at the crate dir per D2) and the
+/// MAIN-root overlay BUILD `overlays/taut-shape/BUILD.bazel` (the single source of truth both razel and
+/// Bazel read). Composition-root policy — the hardcoded host path lives HERE, never in a logic crate. Tests
+/// inject their own registry pointing at fixture dirs; a later phase (D6 C6) parses this from MODULE.bazel.
+pub const TAUT_SHAPE_ROOT: &str = "/Users/owebeeone/limbo/taut-dev/taut-shape-rs/crates/taut-shape";
+pub fn taut_shape_repos() -> ExternalRepos {
+    ExternalRepos::from_pairs([(
+        "taut-shape".to_string(),
+        ExternalRepo {
+            root: HostPath::new(TAUT_SHAPE_ROOT),
+            // taut-shape is BUILD-less → the main-root overlay wins (Some).
+            build_file: Some(RootRelativePath("overlays/taut-shape/BUILD.bazel".to_string())),
+        },
+    )])
 }
 
 // ──────────────── the `build` verb: request TARGET_COMPLETION, then EMIT the outputs to disk ────────────────
@@ -279,10 +434,17 @@ impl BuildSession {
     /// in-memory `BlobStore`. `sys` both feeds the source tree (reads) and receives the emitted outputs
     /// (`write_atomic`) — the one workspace filesystem.
     pub fn new_write(sys: Arc<dyn System>, root: HostPath) -> BuildSession {
+        Self::new_write_with_repos(sys, root, ExternalRepos::empty())
+    }
+
+    /// [`BuildSession::new_write`] with the T17 external-source-roots `repos` registry injected at this
+    /// composition root (empty = byte-identical to `new_write`). The daemon seeds `taut_shape_repos()` here.
+    pub fn new_write_with_repos(sys: Arc<dyn System>, root: HostPath, repos: ExternalRepos) -> BuildSession {
         let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
-        let engine = build_execution_engine_with(
+        let engine = build_execution_engine_with_repos(
             sys.clone(),
             root.clone(),
+            repos,
             Arc::new(razel_exec_api::conformance::WriteStrategy),
             Arc::new(razel_action::SameTargetOrSourceResolver),
             blobs.clone(),
@@ -311,10 +473,17 @@ impl BuildSession {
     /// subprocess end to end (over the UDS socket via the daemon, incrementality intact); no consumer
     /// rewrite from [`BuildSession::new_write`], only the host's strategy choice changes.
     pub fn new_local(sys: Arc<dyn System>, root: HostPath) -> BuildSession {
+        Self::new_local_with_repos(sys, root, ExternalRepos::empty())
+    }
+
+    /// [`BuildSession::new_local`] with the T17 external-source-roots `repos` registry injected (empty =
+    /// byte-identical to `new_local`).
+    pub fn new_local_with_repos(sys: Arc<dyn System>, root: HostPath, repos: ExternalRepos) -> BuildSession {
         let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
-        let engine = build_execution_engine_with(
+        let engine = build_execution_engine_with_repos(
             sys.clone(),
             root.clone(),
+            repos,
             Arc::new(local_exec::DispatchStrategy::new(sys.clone())),
             Arc::new(razel_action::SameTargetOrSourceResolver),
             blobs.clone(),
@@ -330,13 +499,21 @@ impl BuildSession {
     /// REAL `rustc` subprocesses through the same DispatchStrategy → LocalSpawnStrategy leg — over the UDS
     /// socket via the daemon with no daemon rewrite (the strategy + registry are session wiring).
     pub fn new_local_rust(sys: Arc<dyn System>, root: HostPath) -> Result<BuildSession, Error> {
+        Self::new_local_rust_with_repos(sys, root, ExternalRepos::empty())
+    }
+
+    /// [`BuildSession::new_local_rust`] with the T17 external-source-roots `repos` registry injected — the
+    /// path that can build a target whose deps reach an external crate (`//razel-cli:razel` → `razel-comms`
+    /// → `@taut-shape//:taut_shape`). Empty `repos` is byte-identical to `new_local_rust`.
+    pub fn new_local_rust_with_repos(sys: Arc<dyn System>, root: HostPath, repos: ExternalRepos) -> Result<BuildSession, Error> {
         let rustc = rust_toolchain::discover_rustc(sys.as_ref())?;
         let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
         let mut platforms = HashMap::new();
         platforms.insert(rust_toolchain::HOST_CONFIG.to_string(), Platform { constraints: Vec::new() });
-        let (engine, registry) = build_execution_engine_with_toolchains(
+        let (engine, registry) = build_execution_engine_with_toolchains_and_repos(
             sys.clone(),
             root.clone(),
+            repos,
             Arc::new(local_exec::DispatchStrategy::new(sys.clone())),
             Arc::new(razel_action::SameTargetOrSourceResolver),
             blobs.clone(),
@@ -354,6 +531,39 @@ impl BuildSession {
             root,
             configuration: Some(rust_toolchain::HOST_CONFIG.to_string()),
         })
+    }
+
+    /// [`BuildSession::new_local_rust`] driven ENTIRELY by the workspace MODULE.bazel (D6, C6 — the
+    /// over-the-root path): the external-source-roots registry AND the registered-toolchain set are both
+    /// sourced from MODULE.bazel (`new_local_repository` + `register_toolchains`), not hardcoded. The
+    /// toolchains resolve THROUGH THE GRAPH ([`resolve_module_toolchains`]): each registered `toolchain()`
+    /// target is demanded, its impl analyzed, and its `platform_common.ToolchainInfo` extracted. This is the
+    /// single-declaration-surface path — razel and Bazel learn the workspace from the same file.
+    pub fn new_local_rust_from_module(sys: Arc<dyn System>, root: HostPath) -> Result<BuildSession, Error> {
+        let module = module_config::read_module_file(sys.as_ref(), &root)?;
+        let repos = module_config::module_external_repos(&module, &root)?;
+        let blobs: Arc<dyn BlobStore> = Arc::new(razel_action::InMemoryBlobStore::new());
+        let mut platforms = HashMap::new();
+        platforms.insert(rust_toolchain::HOST_CONFIG.to_string(), Platform { constraints: Vec::new() });
+        let (engine, registry) = build_execution_engine_with_toolchains_and_repos(
+            sys.clone(),
+            root.clone(),
+            repos,
+            Arc::new(local_exec::DispatchStrategy::new(sys.clone())),
+            Arc::new(razel_action::SameTargetOrSourceResolver),
+            blobs.clone(),
+            platforms,
+            RegisteredExecPlatform { name: "host".to_string(), constraints: Vec::new() },
+        );
+        // Resolve the MODULE.bazel-registered toolchains through the engine graph and seed the registry.
+        // MUTANT `mutant_toolchain_registration_ignores_module_bazel`: silently SKIP the MODULE.bazel-sourced
+        // registration (the hardcoded-fallback shape) → no rust toolchain is registered under HOST_CONFIG →
+        // a rust build's toolchain resolution fails closed → the over-the-root proof reds.
+        if !cfg!(feature = "mutant_toolchain_registration_ignores_module_bazel") {
+            let rows = module_config::resolve_module_toolchains(&engine, &module, rust_toolchain::HOST_CONFIG)?;
+            registry.set_toolchains(&razel_ids::ConfigId(rust_toolchain::HOST_CONFIG.to_string()), rows);
+        }
+        Ok(BuildSession { engine, blobs, sys, root, configuration: Some(rust_toolchain::HOST_CONFIG.to_string()) })
     }
 
     /// Re-run after a source edit was signaled to the engine (the caller dirties the changed leaf via the

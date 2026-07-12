@@ -1,0 +1,3 @@
+# FIXTURE STUB BUILD for the Bazel-EMBEDDED @bazel_tools repo (T20 R-load). An own-BUILD external repo needs a
+# package root; the R-load closure only load()s tools/build_defs/cc/action_names.bzl, so this root BUILD is
+# intentionally empty (no targets). See tools/build_defs/cc/action_names.bzl for the scope rationale + provenance.

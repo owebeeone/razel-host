@@ -1,0 +1,3 @@
+# FIXTURE STUB BUILD for the generated @cc_compatibility_proxy repo (T20 R-load). An own-BUILD external
+# repo needs a package root; the R-load closure only load()s symbols.bzl, so this BUILD is intentionally
+# empty (no targets). See symbols.bzl for the scope rationale.

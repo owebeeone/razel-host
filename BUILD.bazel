@@ -1,0 +1,34 @@
+# razel-host/BUILD.bazel — razel building its OWN composition root (part of razel-daemon's fat closure). The
+# root wires the whole engine: it links EVERY first-party subsystem (engine impl + source/load/package/
+# analysis/toolchain/action + the bzl-api/bzl-starlark interpreter), so this target's transitive closure is
+# almost the entire fat binary minus the daemon/cli protocol shell. No direct third-party deps — the third
+# party arrives transitively through razel-bzl-starlark. (razel-os-darwin is a DEV-dep only, not linked here.)
+load("//rules/rust:rust.bzl", "rust_library")
+
+rust_library(
+    name = "razel_host",
+    srcs = [
+        "src/lib.rs",  # crate root (listed first)
+        "src/local_exec.rs",
+        "src/module_config.rs",
+        "src/rust_toolchain.rs",
+        "src/workspace.rs",
+    ],
+    deps = [
+        "//razel-core:razel_core",
+        "//razel-ids:razel_ids",
+        "//razel-engine-api:razel_engine_api",
+        "//razel-engine:razel_engine",
+        "//razel-os-api:razel_os_api",
+        "//razel-source:razel_source",
+        "//razel-load:razel_load",
+        "//razel-package:razel_package",
+        "//razel-analysis:razel_analysis",
+        "//razel-toolchain:razel_toolchain",
+        "//razel-action:razel_action",
+        "//razel-exec-api:razel_exec_api",
+        "//razel-bzl-api:razel_bzl_api",
+        "//razel-bzl-starlark:razel_bzl_starlark",
+    ],
+    visibility = ["//visibility:public"],  # consumed cross-package (razel-daemon root)
+)

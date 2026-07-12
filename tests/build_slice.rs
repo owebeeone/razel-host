@@ -96,7 +96,8 @@ fn hello_rules(content_literal: &str) -> Vec<u8> {
     format!(
         "NumberInfo = provider(\"NumberInfo\", fields = [\"x\"])\n\
          def _impl(ctx):\n\
-         \x20   write_file(output = \"hello/out.txt\", content = \"{content_literal}\")\n\
+         \x20   out = ctx.actions.declare_file(\"out.txt\")\n\
+         \x20   ctx.actions.write(output = out, content = \"{content_literal}\")\n\
          \x20   return [NumberInfo(x = 1)]\n\
          my_rule = rule(implementation = _impl, attrs = {{}})\n"
     )

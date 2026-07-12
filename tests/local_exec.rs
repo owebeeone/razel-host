@@ -109,7 +109,7 @@ fn action_value(v: &NodeValue) -> ActionValue {
 // exact-env-spawn safe).
 const GENRULE_RULES: &[u8] = b"NumberInfo = provider(\"NumberInfo\", fields = [\"x\"])\n\
 def _impl(ctx):\n\
-\x20   declare_action(mnemonic = \"Genrule\", argv = [\"/bin/sh\", \"-c\", \"/bin/cat genrule/in.txt > genrule/out.txt\"], outputs = [\"genrule/out.txt\"], inputs = [\"genrule/in.txt\"])\n\
+\x20   ctx.actions.run(mnemonic = \"Genrule\", executable = \"/bin/sh\", arguments = [\"-c\", \"/bin/cat genrule/in.txt > genrule/out.txt\"], outputs = [\"genrule/out.txt\"], inputs = [\"genrule/in.txt\"])\n\
 \x20   return [NumberInfo(x = 1)]\n\
 my_rule = rule(implementation = _impl, attrs = {})\n";
 const GENRULE_BUILD: &[u8] = b"load(\":rules.bzl\", \"my_rule\")\nmy_rule(name = \"out.txt\")\n";

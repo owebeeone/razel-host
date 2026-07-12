@@ -35,6 +35,11 @@ mutant_file_hashes_stat = ["razel-source/mutant_file_hashes_stat"]
 mutant_glob_depends_on_content = ["razel-source/mutant_glob_depends_on_content"]
 mutant_package_ignore_loads = ["razel-package/mutant_package_ignore_loads"]
 mutant_package_allow_dup_names = ["razel-bzl-starlark/mutant_package_allow_dup_names"]
+# T19 P1b passthroughs: drive the per-crate-attr mutants over the composition root (tests/rust_p1.rs).
+# string_list dropped → crate_features vanish → the cfg-gated fn is not compiled (crate_features proof RED);
+# string default ignored → `edition` collapses to "" → `--edition=` is rejected by rustc (any P1 build RED).
+mutant_string_list_attr_dropped = ["razel-bzl-starlark/mutant_string_list_attr_dropped"]
+mutant_attr_string_default_ignored = ["razel-bzl-starlark/mutant_attr_string_default_ignored"]
 mutant_ct_drops_config = ["razel-analysis/mutant_ct_drops_config"]
 mutant_ct_skips_rule_file_dep = ["razel-analysis/mutant_ct_skips_rule_file_dep"]
 mutant_ct_drops_toolchains = ["razel-analysis/mutant_ct_drops_toolchains"]
@@ -55,10 +60,31 @@ mutant_chain_drops_dep_files = ["razel-analysis/mutant_chain_drops_dep_files"]
 # building its OWN real razel-wire-cbor → razel-wire-api → razel-core chain goes RED when a dep-of-dep rlib
 # can no longer resolve to its producer).
 mutant_transitive_outputs_not_merged = ["razel-analysis/mutant_transitive_outputs_not_merged"]
+# C7 visibility: drive the enforcement mutant over the composition root (tests/visibility.rs — a private
+# cross-package dep must fail the build closed).
+mutant_visibility_ignored = ["razel-analysis/mutant_visibility_ignored"]
+# T19-P2 alias builtin: drive the provider-passthrough mutant over the composition root — a consumer that
+# reaches a vendored crate through the `//crates:<crate>` hub alias fails to build when the alias
+# drops the actual's providers (tests/rust_third_party.rs goes RED).
+mutant_alias_breaks_provider_passthrough = ["razel-analysis/mutant_alias_breaks_provider_passthrough"]
 mutant_load_pkg_resolution_absorbs = ["razel-load/mutant_load_pkg_resolution_absorbs"]
+# T20 R1 passthroughs: drive the two repo-registry / repo-context mutants over the composition root. The
+# registry-ignoring mutant absorbs an undeclared `@decoy//…` to a main-root decoy → the EXISTING pkg_loads
+# `unsupported_load_form_fails_closed_over_the_root` decoy proof reds (decoy-proven like T17).
+mutant_repo_load_ignores_registry = ["razel-load/mutant_repo_load_ignores_registry"]
+mutant_repo_context_dropped = ["razel-load/mutant_repo_context_dropped"]
 # build-verb slice (BAR-FIRST-SLICE execution leg): the emit is DROPPED — TARGET_COMPLETION is still
 # requested (the graph builds) but the produced output never reaches disk. Drives tests/build_slice.rs RED.
 mutant_build_skips_output_emit = []
+# B2 workspace-marker discovery: skip the up-walk and return the bare start dir (cwd) directly — the pre-B2
+# "the root IS the cwd" shortcut discovery replaces. A subdir start then resolves to itself + a marker-less
+# chain "succeeds" instead of failing closed: the workspace.rs discovery tests (run under `--lib`) go RED.
+mutant_root_discovery_uses_bare_cwd = []
+# D6 (C6): the registered-toolchain set is NOT sourced from MODULE.bazel's register_toolchains — the
+# resolution is silently skipped (the hardcoded-fallback shape), so a rust build over the MODULE.bazel-driven
+# session has NO toolchain registered under HOST_CONFIG and its resolution fails closed. The over-the-root
+# module-driven toolchain proof (tests/module_toolchains.rs) goes RED. Never enable in a real build.
+mutant_toolchain_registration_ignores_module_bazel = []
 # real-execution leg (LocalSpawnStrategy). RED-FIRST: staging SKIPS an input file → the subprocess (a
 # genrule `cat <in> > <out>`) cannot read it, exits nonzero, and the spawn fails closed → the real-exec
 # proof (tests/local_exec.rs) goes RED. Never enable in a real build.
@@ -67,3 +93,10 @@ mutant_stage_drops_input = []
 # collect returns FABRICATED bytes instead of READING the staged output file → the output-bytes assertion
 # fails → tests/local_exec.rs goes RED. Never enable in a real build.
 mutant_collect_fabricates_output = []
+# T19-P3 (tests/rust_fat_selfhost.rs, the extern-rename fixture): NEUTER rust.bzl's per-dep extern-rename
+# branch at stage time — a consumer whose source `use libc_errno::…` depends on a crate named `errno_like`
+# renamed via `extern_renames = ["libc_errno"]` then gets `--extern errno_like=…` (crate_name) instead, so
+# `use libc_errno` fails to resolve (E0432) and the build fails closed → the fixture goes RED. This is a
+# TEST-LEVEL mutant (rust.bzl is frozen shared data both tools execute — it cannot carry a cfg): the test
+# transforms the SHIPPED rust.bzl in place and asserts the branch marker exists (stale-proof). Never in a real build.
+mutant_extern_rename_dropped = []
